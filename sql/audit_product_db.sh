@@ -40,7 +40,24 @@ psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" << 'EOF' | tee -a "
 \timing off
 \x off
 
-\echo '--- [1.1] Instance Connections Summary ---'
+\echo '--- [1.1] Instance Hardware Resources: Storage, RAM & CPU Load ---'
+SELECT 
+    pg_size_pretty(sum(pg_database_size(datname))) AS total_database_storage_used,
+    current_setting('shared_buffers') AS shared_buffers_ram,
+    current_setting('work_mem') AS work_mem_per_query,
+    current_setting('effective_cache_size') AS effective_cache_size,
+    (SELECT round(sum(blks_hit)*100.0/nullif(sum(blks_hit + blks_read),0), 2) FROM pg_stat_database) AS cache_hit_ratio_pct;
+
+\echo '--- [1.1b] CPU Computing Queries vs Waiting Backends ---'
+SELECT 
+    count(*) AS total_backends,
+    count(*) FILTER (WHERE state = 'active' AND pid != pg_backend_pid()) AS cpu_computing_queries,
+    count(*) FILTER (WHERE wait_event_type = 'IO') AS io_waiting_queries,
+    count(*) FILTER (WHERE wait_event_type = 'Lock') AS lock_waiting_queries,
+    count(*) FILTER (WHERE state = 'idle') AS idle_sessions
+FROM pg_stat_activity;
+
+\echo '--- [1.2] Instance Connections Summary ---'
 SELECT 
     (SELECT count(*) FROM pg_stat_activity) AS current_connections,
     (SELECT count(*) FROM pg_stat_activity WHERE state = 'active') AS active_connections,
@@ -48,7 +65,7 @@ SELECT
     (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_allowed_connections,
     ROUND(((SELECT count(*)::numeric FROM pg_stat_activity) / (SELECT setting::numeric FROM pg_settings WHERE name = 'max_connections')) * 100, 2) AS usage_percent;
 
-\echo '--- [1.2] Connections Distribution Per Database ---'
+\echo '--- [1.3] Connections Distribution Per Database ---'
 SELECT 
     COALESCE(datname, '[Cluster Worker]') AS database_name,
     count(*) AS total_conns,
@@ -58,19 +75,19 @@ FROM pg_stat_activity
 GROUP BY datname
 ORDER BY total_conns DESC;
 
-\echo '--- [1.3] Instance Users & Roles ---'
+\echo '--- [1.4] Instance Users & Roles ---'
 SELECT rolname, rolsuper, rolcanlogin, rolconnlimit FROM pg_roles ORDER BY rolcanlogin DESC, rolname;
 
-\echo '--- [1.4] Engine Version & Uptime ---'
+\echo '--- [1.5] Engine Version & Uptime ---'
 SELECT version(), pg_postmaster_start_time() AS instance_started;
 
-\echo '--- [1.5] Listening Ports & SSL ---'
+\echo '--- [1.6] Listening Ports & SSL ---'
 SELECT name, setting FROM pg_settings WHERE name IN ('port', 'listen_addresses', 'ssl');
 
-\echo '--- [1.6] Active Worker Processes ---'
+\echo '--- [1.7] Active Worker Processes ---'
 SELECT backend_type, count(*) FROM pg_stat_activity GROUP BY backend_type ORDER BY count(*) DESC;
 
-\echo '--- [1.7] Startup Postmaster Parameters ---'
+\echo '--- [1.8] Startup Postmaster Parameters ---'
 SELECT name, setting, source FROM pg_settings WHERE context = 'postmaster' LIMIT 20;
 EOF
 
