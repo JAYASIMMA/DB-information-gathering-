@@ -577,22 +577,52 @@ def main():
     parser.add_argument("--skip-db", action="store_true", help="Skip direct DB connection and only inspect AWS infra")
     parser.add_argument("--no-all-db", action="store_true", help="Do not iterate across all other databases in instance")
 
+    # Target preset
+    parser.add_argument("--target", choices=["market", "product"], help="Select target preset from .env (market or product)")
+
     # Output options
     parser.add_argument("--json", action="store_true", help="Output full report as JSON")
     parser.add_argument("--output-log", default="audit_output.log", help="File to write formatted log output (default: audit_output.log)")
 
     args = parser.parse_args()
 
-    # Parse --database-url if provided
-    host = args.host
-    port = args.port
-    user = args.user
-    password = args.password
-    dbname = args.dbname
+    # Determine default variables based on --target
+    if args.target == "product":
+        default_url = os.getenv("PRODUCT_DATABASE_URL")
+        default_user = os.getenv("PRODUCT_DB_USER", "bl_pg_admin")
+        default_pwd = os.getenv("PRODUCT_DB_PWD") or os.getenv("PRODUCT_DB_PASSWORD")
+        default_host = os.getenv("PRODUCT_DB_HOST", "bettrlabsprod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com")
+        default_port = int(os.getenv("PRODUCT_DB_PORT", "5432"))
+        default_dbname = os.getenv("PRODUCT_DB_NAME", "ag4good_db")
+        default_instance = os.getenv("PRODUCT_DB_INSTANCE_IDENTIFIER", "bettrlabsprod")
+    else:
+        default_url = os.getenv("DATABASE_URL") or os.getenv("MARKET_DATABASE_URL")
+        default_user = os.getenv("DB_USER") or os.getenv("MARKET_DB_USER")
+        default_pwd = os.getenv("DB_PASSWORD") or os.getenv("MARKET_DB_PASSWORD")
+        default_host = os.getenv("DB_HOST") or os.getenv("MARKET_DB_HOST")
+        default_port = int(os.getenv("DB_PORT", "0") or os.getenv("MARKET_DB_PORT", "0") or "0")
+        default_dbname = os.getenv("DB_NAME") or os.getenv("MARKET_DB_NAME")
+        default_instance = os.getenv("DB_INSTANCE_IDENTIFIER") or os.getenv("MARKET_DB_INSTANCE_IDENTIFIER")
 
-    db_url = args.database_url or os.getenv("DATABASE_URL")
+    # Parse --database-url if provided or use target default
+    host = args.host or default_host
+    port = args.port or default_port
+    user = args.user or default_user
+    password = args.password or default_pwd
+    dbname = args.dbname or default_dbname
+
+    db_url = args.database_url or default_url
     if db_url:
-        parsed = urlparse(db_url)
+        # Strip dialect suffixes e.g. postgresql+asyncpg -> postgresql
+        clean_url = db_url
+        if "+asyncpg" in clean_url:
+            clean_url = clean_url.replace("+asyncpg", "")
+        elif "+" in clean_url.split("://")[0]:
+            s = clean_url.split("://")[0].split("+")[0]
+            r = clean_url.split("://")[1]
+            clean_url = f"{s}://{r}"
+
+        parsed = urlparse(clean_url)
         if parsed.scheme in ("postgres", "postgresql"):
             args.engine = "postgres"
         elif parsed.scheme in ("mysql", "mariadb"):
@@ -612,7 +642,7 @@ def main():
 
     # 1. AWS API
     if not args.skip_aws:
-        identifier = args.db_identifier or os.getenv("DB_INSTANCE_IDENTIFIER")
+        identifier = args.db_identifier or default_instance or os.getenv("DB_INSTANCE_IDENTIFIER")
         if not identifier and host and ".rds.amazonaws.com" in host:
             # Extract instance identifier from host prefix (e.g. bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com)
             identifier = host.split(".")[0]

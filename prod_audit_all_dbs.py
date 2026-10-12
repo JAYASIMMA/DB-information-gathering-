@@ -4,8 +4,8 @@ Production Multi-Database Audit Script for AWS RDS & Aurora PostgreSQL.
 Designed to run in production environments (EC2, Bastion, or directly via uv/python).
 
 Features:
-- Connects at the instance level.
-- Discovers all databases dynamically.
+- Audits Instance-Level Hardware: CPU Usage (CloudWatch + SQL Load), Free & Allocated Storage, RAM Usage (Freeable RAM + Shared Buffers).
+- Discovers and audits all databases dynamically.
 - Connects to every individual database on the instance.
 - Audits connections, users, workers, startup settings, and per-database tables/sizes.
 - Writes a timestamped production log file with full details.
@@ -35,16 +35,77 @@ except ImportError:
 def print_table(rows, headers):
     if HAS_TABULATE:
         return tabulate(rows, headers=headers, tablefmt="rounded_grid")
-    # Fallback if tabulate is not installed
     lines = [" | ".join(str(h) for h in headers), "-" * 60]
     for r in rows:
         lines.append(" | ".join(str(v) for v in r))
     return "\n".join(lines)
 
 
+def fetch_cloudwatch_hardware_metrics(instance_id: str, region: str = "ap-south-1"):
+    """
+    Fetches real-time AWS CloudWatch hardware metrics:
+    - CPUUtilization (%)
+    - FreeableMemory (RAM in GB/MB)
+    - FreeStorageSpace (EBS Storage in GB)
+    - IOPS (Read/Write)
+    - RDS Instance details (Allocated storage, instance class)
+    """
+    try:
+        import boto3
+        from botocore.exceptions import ClientError, NoCredentialsError
+    except ImportError:
+        return {"error": "boto3 library not installed"}
+
+    metrics = {}
+    try:
+        rds = boto3.client("rds", region_name=region)
+        try:
+            db_res = rds.describe_db_instances(DBInstanceIdentifier=instance_id)
+            if db_res.get("DBInstances"):
+                db = db_res["DBInstances"][0]
+                metrics["allocated_storage_gb"] = db.get("AllocatedStorage")
+                metrics["storage_type"] = db.get("StorageType")
+                metrics["instance_class"] = db.get("DBInstanceClass")
+                metrics["max_allocated_storage_gb"] = db.get("MaxAllocatedStorage")
+        except Exception as e:
+            metrics["rds_info_note"] = str(e)
+
+        cw = boto3.client("cloudwatch", region_name=region)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start = now - datetime.timedelta(minutes=15)
+
+        metric_names = ["CPUUtilization", "FreeableMemory", "FreeStorageSpace", "ReadIOPS", "WriteIOPS"]
+        for m_name in metric_names:
+            try:
+                res = cw.get_metric_statistics(
+                    Namespace="AWS/RDS",
+                    MetricName=m_name,
+                    Dimensions=[{"Name": "DBInstanceIdentifier", "Value": instance_id}],
+                    StartTime=start,
+                    EndTime=now,
+                    Period=300,
+                    Statistics=["Average", "Maximum"],
+                )
+                datapoints = res.get("Datapoints", [])
+                if datapoints:
+                    datapoints.sort(key=lambda x: x["Timestamp"], reverse=True)
+                    latest = datapoints[0]
+                    metrics[m_name] = {
+                        "Average": latest.get("Average"),
+                        "Maximum": latest.get("Maximum"),
+                    }
+            except Exception:
+                pass
+        return metrics
+    except (NoCredentialsError, ClientError) as e:
+        return {"error": f"AWS credentials/CloudWatch unavailable: {str(e)}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def run_production_audit():
     # 1. Parse connection string
-    db_url = os.getenv("DATABASE_URL")
+    db_url = os.getenv("DATABASE_URL") or os.getenv("MARKET_DATABASE_URL")
     if not db_url and len(sys.argv) > 1:
         db_url = sys.argv[1]
 
@@ -59,6 +120,8 @@ def run_production_audit():
     host = parsed.hostname or "localhost"
     port = parsed.port or 5432
     default_db = parsed.path.lstrip("/") if parsed.path else "postgres"
+    instance_id = os.getenv("DB_INSTANCE_IDENTIFIER", "bettrlabs-mp-prod")
+    region = os.getenv("AWS_REGION", "ap-south-1")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_filename = f"rds_production_audit_{timestamp}.log"
@@ -70,9 +133,10 @@ def run_production_audit():
         log_lines.append(str(msg))
 
     log("=" * 85)
-    log(f" AWS RDS MULTI-DATABASE PRODUCTION AUDIT REPORT ".center(85, "="))
-    log(f" Generated: {datetime.datetime.now().isoformat()} ".center(85, " "))
+    log(" AWS RDS MULTI-DATABASE PRODUCTION AUDIT REPORT ".center(85, "="))
+    log(f" Generated  : {datetime.datetime.now().isoformat()} ".center(85, " "))
     log(f" Target Host: {host}:{port} ".center(85, " "))
+    log(f" Primary DB : {default_db} | Instance: {instance_id} ".center(85, " "))
     log("=" * 85)
 
     # 2. Connect to primary database to collect cluster-wide metrics
@@ -93,6 +157,77 @@ def run_production_audit():
         with open(log_filename, "w", encoding="utf-8") as f:
             f.write("\n".join(log_lines))
         return
+
+    # --------------------------------------------------------------------------
+    # HARDWARE RESOURCE AUDIT: CPU, STORAGE & RAM USAGE
+    # --------------------------------------------------------------------------
+    log("\n" + "=" * 85)
+    log("[+] HARDWARE METRICS: CPU USAGE, STORAGE & RAM USAGE")
+    log("=" * 85)
+
+    # A. AWS CloudWatch Metrics
+    cw_metrics = fetch_cloudwatch_hardware_metrics(instance_id, region=region)
+    if cw_metrics and "error" not in cw_metrics:
+        log("\n--- [AWS CloudWatch Real-Time Host Metrics] ---")
+        hw_rows = []
+        if "instance_class" in cw_metrics:
+            hw_rows.append(["Instance Class", cw_metrics.get("instance_class", "N/A")])
+        if "allocated_storage_gb" in cw_metrics:
+            hw_rows.append(["Allocated EBS Storage", f"{cw_metrics.get('allocated_storage_gb')} GB ({cw_metrics.get('storage_type', 'gp3')})"])
+        if "CPUUtilization" in cw_metrics:
+            cpu = cw_metrics["CPUUtilization"]
+            hw_rows.append(["CPU Utilization (Host)", f"Average: {cpu['Average']:.2f}% | Peak: {cpu['Maximum']:.2f}%"])
+        if "FreeableMemory" in cw_metrics:
+            mem_bytes = cw_metrics["FreeableMemory"]["Average"]
+            hw_rows.append(["Freeable RAM (Host)", f"{mem_bytes / (1024**3):.2f} GB ({mem_bytes / (1024**2):.1f} MB)"])
+        if "FreeStorageSpace" in cw_metrics:
+            disk_bytes = cw_metrics["FreeStorageSpace"]["Average"]
+            hw_rows.append(["Free Storage Space (EBS)", f"{disk_bytes / (1024**3):.2f} GB remaining"])
+        if "ReadIOPS" in cw_metrics and "WriteIOPS" in cw_metrics:
+            r_iops = cw_metrics['ReadIOPS']['Average']
+            w_iops = cw_metrics['WriteIOPS']['Average']
+            hw_rows.append(["Disk IOPS", f"Read: {r_iops:.1f} IOPS | Write: {w_iops:.1f} IOPS"])
+
+        log(print_table(hw_rows, headers=["Host Hardware Metric", "Measured Value"]))
+    else:
+        log(f"\n[*] CloudWatch Notice: {cw_metrics.get('error', 'AWS API not queried directly')}")
+        log("    (Reading detailed internal database storage & memory metrics below via SQL)")
+
+    # B. Database Engine Storage Metrics
+    log("\n--- [Database Engine Storage Allocation] ---")
+    total_db_storage = root_con.run("SELECT pg_size_pretty(sum(pg_database_size(datname))) FROM pg_database;")[0][0]
+    log(f"  * Total Storage Consumed Across All Databases: {total_db_storage}")
+
+    tablespace_rows = root_con.run("SELECT spcname, pg_size_pretty(pg_tablespace_size(spcname)) FROM pg_tablespace;")
+    log(print_table(tablespace_rows, headers=["Tablespace Name", "Disk Space Used"]))
+
+    # C. Database RAM Memory Settings & Cache Hit Ratio
+    log("\n--- [Database RAM Allocation & Cache Performance] ---")
+    mem_settings = root_con.run("""
+        SELECT name, setting, unit, short_desc 
+        FROM pg_settings 
+        WHERE name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem', 'effective_cache_size', 'temp_buffers');
+    """)
+    log(print_table([[r[0], f"{r[1]} {r[2] or ''}".strip(), r[3]] for r in mem_settings], headers=["Memory Parameter", "Allocated RAM", "Description"]))
+
+    cache_hit = root_con.run("SELECT round(sum(blks_hit)*100.0/nullif(sum(blks_hit + blks_read),0), 2) FROM pg_stat_database;")[0][0]
+    log(f"\n  * Buffer Cache Hit Ratio: {cache_hit}% (RAM Cache Efficiency - healthy is >99%)")
+
+    # D. Database Active CPU Query Load
+    log("\n--- [Database Query Activity & CPU Load Breakdown] ---")
+    query_load = root_con.run("""
+        SELECT 
+            count(*) AS total_backends,
+            count(*) FILTER (WHERE state = 'active' AND pid != pg_backend_pid()) AS cpu_computing_queries,
+            count(*) FILTER (WHERE wait_event_type = 'IO') AS io_waiting_queries,
+            count(*) FILTER (WHERE wait_event_type = 'Lock') AS lock_waiting_queries,
+            count(*) FILTER (WHERE state = 'idle') AS idle_sessions
+        FROM pg_stat_activity;
+    """)[0]
+    log(print_table(
+        [[query_load[0], query_load[1], query_load[2], query_load[3], query_load[4]]],
+        headers=["Total Backends", "Active CPU Queries", "I/O Waiting", "Lock Waiting", "Idle Sessions"]
+    ))
 
     # --------------------------------------------------------------------------
     # SECTION 1: INSTANCE-LEVEL CONNECTION SUMMARY
@@ -276,7 +411,7 @@ def run_production_audit():
             """)[0]
             log(f"  * User Tables: {table_summary[0]} | Views: {table_summary[1]} | Indexes: {table_summary[2]}")
 
-            # Top 10 largest tables in this database
+            # Top 8 largest tables in this database
             top_tables = db_con.run("""
                 SELECT 
                     schemaname || '.' || relname AS table_name,

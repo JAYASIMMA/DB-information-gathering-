@@ -112,6 +112,8 @@ In AWS RDS and Aurora, standard bare-metal Linux inspection does not apply:
 ---
 
 ## Standalone Assets in Repo
+- `audit_product_db.py`: Dedicated script auditing the Product DB (`bettrlabsprod / ag4good_db`) across all databases.
+- `sql/audit_product_db.sh`: Shell script to audit Product DB directly from EC2 via `psql`.
 - `prod_audit_all_dbs.py`: Production-ready script iterating through every database on the RDS instance.
 - `sql/prod_audit_all_dbs.sh`: Zero-dependency bash/psql script for direct execution on EC2 / CloudShell.
 - `src/inspector.py`: Unified Python inspector combining AWS Boto3 + SQL drivers.
