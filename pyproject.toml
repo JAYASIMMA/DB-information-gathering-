@@ -1,0 +1,13 @@
+[project]
+name = "db-information"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.43.111",
+    "pg8000>=1.31.5",
+    "pymysql>=1.2.3",
+    "python-dotenv>=1.2.4",
+    "tabulate>=0.10.0",
+]
