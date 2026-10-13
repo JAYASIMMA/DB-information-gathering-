@@ -112,11 +112,13 @@ In AWS RDS and Aurora, standard bare-metal Linux inspection does not apply:
 ---
 
 ## Standalone Assets in Repo
+- `audit_both_instances.py`: Dual-instance hardware inspector auditing Total Storage, Instance Class, CPU & RAM Usage side-by-side for both `bettrlabs-mp-prod` and `bettrlabsprod`.
+- `sql/audit_both_instances.sh`: Zero-dependency shell script auditing both instances directly from EC2 via `psql`.
 - `audit_product_db.py`: Dedicated script auditing the Product DB (`bettrlabsprod / ag4good_db`) across all databases.
 - `sql/audit_product_db.sh`: Shell script to audit Product DB directly from EC2 via `psql`.
 - `prod_audit_all_dbs.py`: Production-ready script iterating through every database on the RDS instance.
 - `sql/prod_audit_all_dbs.sh`: Zero-dependency bash/psql script for direct execution on EC2 / CloudShell.
-- `src/inspector.py`: Unified Python inspector combining AWS Boto3 + SQL drivers.
+- `src/inspector.py`: Unified Python inspector combining AWS Boto3 + SQL drivers, supporting single target (`market`, `product`) or dual target (`both`).
 - `sql/postgres_audit.sql`: Zero-dependency SQL script runnable via `psql`, DBeaver, or pgAdmin.
 - `sql/mysql_audit.sql`: Zero-dependency SQL script runnable via MySQL client.
 - `.env.example`: Configuration template for credentials.

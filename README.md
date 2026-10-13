@@ -13,14 +13,17 @@ cp .env.example .env
 # 2. View help options
 uv run main.py --help
 
-# 3. Inspect an AWS RDS / Aurora instance (AWS API + Direct DB)
-uv run main.py --db-identifier my-db-instance --region us-east-1 --engine postgres --user postgres
+# 3. Audit BOTH instances side-by-side (Total Storage, Instance Class, CPU & RAM Usage)
+uv run audit_both_instances.py
+# Or:
+uv run main.py --target both
 
-# 4. Or inspect using only AWS APIs (no direct DB connection needed)
-uv run main.py --db-identifier my-db-instance --region us-east-1 --skip-db
+# 4. Inspect an individual AWS RDS / Aurora instance
+uv run main.py --target market
+uv run main.py --target product
 
-# 5. Or inspect directly via SQL connection (no AWS credentials needed)
-uv run main.py --skip-aws --engine postgres --host <endpoint> --port 5432 --user postgres --password <secret>
+# 5. Inspect an AWS RDS / Aurora instance by identifier (AWS API + Direct DB)
+uv run main.py --db-identifier my-db-instance --region ap-south-1 --engine postgres --user postgres
 ```
 
 ## Standalone SQL Scripts

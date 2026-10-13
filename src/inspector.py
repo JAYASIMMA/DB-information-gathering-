@@ -2,27 +2,98 @@ import os
 import sys
 import json
 import argparse
-from typing import Dict, Any, List
+import datetime
+from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 from tabulate import tabulate
 
+# Ensure console supports UTF-8 on Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 load_dotenv()
 
 # ==============================================================================
-# AWS RDS & AURORA INFRASTRUCTURE COLLECTOR (via boto3)
+# AWS RDS INSTANCE HARDWARE SPECIFICATIONS DATABASE
+# ==============================================================================
+RDS_INSTANCE_SPECS: Dict[str, Dict[str, Any]] = {
+    # T4g (Graviton2)
+    "db.t4g.micro": {"vcpus": 2, "ram_gb": 1.0},
+    "db.t4g.small": {"vcpus": 2, "ram_gb": 2.0},
+    "db.t4g.medium": {"vcpus": 2, "ram_gb": 4.0},
+    "db.t4g.large": {"vcpus": 2, "ram_gb": 8.0},
+    "db.t4g.xlarge": {"vcpus": 4, "ram_gb": 16.0},
+    "db.t4g.2xlarge": {"vcpus": 8, "ram_gb": 32.0},
+    # T3 (Intel)
+    "db.t3.micro": {"vcpus": 2, "ram_gb": 1.0},
+    "db.t3.small": {"vcpus": 2, "ram_gb": 2.0},
+    "db.t3.medium": {"vcpus": 2, "ram_gb": 4.0},
+    "db.t3.large": {"vcpus": 2, "ram_gb": 8.0},
+    "db.t3.xlarge": {"vcpus": 4, "ram_gb": 16.0},
+    "db.t3.2xlarge": {"vcpus": 8, "ram_gb": 32.0},
+    # M6g (Graviton2)
+    "db.m6g.large": {"vcpus": 2, "ram_gb": 8.0},
+    "db.m6g.xlarge": {"vcpus": 4, "ram_gb": 16.0},
+    "db.m6g.2xlarge": {"vcpus": 8, "ram_gb": 32.0},
+    "db.m6g.4xlarge": {"vcpus": 16, "ram_gb": 64.0},
+    "db.m6g.8xlarge": {"vcpus": 32, "ram_gb": 128.0},
+    "db.m6g.12xlarge": {"vcpus": 48, "ram_gb": 192.0},
+    "db.m6g.16xlarge": {"vcpus": 64, "ram_gb": 256.0},
+    # M5 (Intel)
+    "db.m5.large": {"vcpus": 2, "ram_gb": 8.0},
+    "db.m5.xlarge": {"vcpus": 4, "ram_gb": 16.0},
+    "db.m5.2xlarge": {"vcpus": 8, "ram_gb": 32.0},
+    "db.m5.4xlarge": {"vcpus": 16, "ram_gb": 64.0},
+    # R6g (Memory-Optimized Graviton2)
+    "db.r6g.large": {"vcpus": 2, "ram_gb": 16.0},
+    "db.r6g.xlarge": {"vcpus": 4, "ram_gb": 16.0},
+    "db.r6g.2xlarge": {"vcpus": 8, "ram_gb": 64.0},
+    "db.r6g.4xlarge": {"vcpus": 16, "ram_gb": 128.0},
+    # R5 (Memory-Optimized Intel)
+    "db.r5.large": {"vcpus": 2, "ram_gb": 16.0},
+    "db.r5.xlarge": {"vcpus": 4, "ram_gb": 32.0},
+    "db.r5.2xlarge": {"vcpus": 8, "ram_gb": 64.0},
+}
+
+
+def get_instance_class_specs(instance_class: Optional[str]) -> Dict[str, Any]:
+    if not instance_class:
+        return {"vcpus": "Unknown", "ram_gb": None, "label": "Unknown"}
+    cls_key = instance_class.strip().lower()
+    if cls_key in RDS_INSTANCE_SPECS:
+        s = RDS_INSTANCE_SPECS[cls_key]
+        return {
+            "vcpus": s["vcpus"],
+            "ram_gb": s["ram_gb"],
+            "label": f"{instance_class} ({s['vcpus']} vCPUs, {s['ram_gb']} GB RAM)",
+        }
+    return {
+        "vcpus": "N/A",
+        "ram_gb": None,
+        "label": instance_class,
+    }
+
+
+# ==============================================================================
+# AWS RDS & AURORA INFRASTRUCTURE & CLOUDWATCH COLLECTOR (via boto3)
 # ==============================================================================
 
 def audit_aws_rds_infra(db_identifier: str, region_name: str = "ap-south-1") -> Dict[str, Any]:
     """
     Audits AWS RDS / Aurora infrastructure configurations:
+    - Real-time CPU Utilization, Freeable RAM, Free/Allocated Storage (via CloudWatch)
     - Engine & OS maintenance/patch updates
     - Network security groups and open ports
     - Database parameter groups (startup command equivalents)
     """
     try:
         import boto3
-        from botocore.exceptions import ClientError
+        from botocore.exceptions import ClientError, NoCredentialsError
     except ImportError:
         return {"error": "boto3 library is required. Install via `uv add boto3`"}
 
@@ -33,6 +104,7 @@ def audit_aws_rds_infra(db_identifier: str, region_name: str = "ap-south-1") -> 
         "db_identifier": db_identifier,
         "region": region_name,
         "instance_info": {},
+        "hardware_metrics": {},
         "os_and_patches": {},
         "network_and_ports": {},
         "startup_parameters": {},
@@ -43,24 +115,98 @@ def audit_aws_rds_infra(db_identifier: str, region_name: str = "ap-south-1") -> 
         if not instances["DBInstances"]:
             return {"error": f"No DB instance found with identifier: {db_identifier}"}
         db = instances["DBInstances"][0]
-    except ClientError as e:
+    except (NoCredentialsError, ClientError) as e:
         return {"error": f"AWS ClientError: {str(e)}"}
+    except Exception as e:
+        return {"error": str(e)}
 
     # 1. Instance & Engine
     engine = db.get("Engine")
     engine_ver = db.get("EngineVersion")
     endpoint = db.get("Endpoint", {})
+    inst_class = db.get("DBInstanceClass")
+    specs = get_instance_class_specs(inst_class)
+    allocated_gb = db.get("AllocatedStorage")
+    storage_type = db.get("StorageType", "gp3")
+    max_allocated_gb = db.get("MaxAllocatedStorage")
+
     results["instance_info"] = {
         "DBInstanceIdentifier": db.get("DBInstanceIdentifier"),
         "DBClusterIdentifier": db.get("DBClusterIdentifier", "N/A (Standard RDS)"),
-        "DBInstanceClass": db.get("DBInstanceClass"),
+        "DBInstanceClass": specs.get("label", inst_class),
         "Engine": engine,
         "EngineVersion": engine_ver,
         "Status": db.get("DBInstanceStatus"),
         "MultiAZ": db.get("MultiAZ"),
-        "StorageType": db.get("StorageType"),
-        "AllocatedStorage": f"{db.get('AllocatedStorage')} GB",
+        "StorageType": storage_type,
+        "AllocatedStorage": f"{allocated_gb} GB",
+        "MaxAllocatedStorage": f"{max_allocated_gb} GB" if max_allocated_gb else "N/A",
     }
+
+    # 1.1 Real-time Hardware Metrics (CloudWatch)
+    hw_metrics: Dict[str, Any] = {
+        "instance_class": inst_class,
+        "instance_class_specs": specs,
+        "allocated_storage_gb": allocated_gb,
+        "storage_type": storage_type,
+        "max_allocated_storage_gb": max_allocated_gb,
+    }
+    try:
+        cw = boto3.client("cloudwatch", region_name=region_name)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start = now - datetime.timedelta(minutes=15)
+        metric_names = ["CPUUtilization", "FreeableMemory", "FreeStorageSpace", "ReadIOPS", "WriteIOPS"]
+        for m_name in metric_names:
+            try:
+                res = cw.get_metric_statistics(
+                    Namespace="AWS/RDS",
+                    MetricName=m_name,
+                    Dimensions=[{"Name": "DBInstanceIdentifier", "Value": db_identifier}],
+                    StartTime=start,
+                    EndTime=now,
+                    Period=300,
+                    Statistics=["Average", "Maximum"],
+                )
+                datapoints = res.get("Datapoints", [])
+                if datapoints:
+                    datapoints.sort(key=lambda x: x["Timestamp"], reverse=True)
+                    latest = datapoints[0]
+                    hw_metrics[m_name] = {
+                        "Average": latest.get("Average"),
+                        "Maximum": latest.get("Maximum"),
+                    }
+            except Exception:
+                pass
+
+        if "CPUUtilization" in hw_metrics:
+            hw_metrics["cpu_avg_pct"] = round(hw_metrics["CPUUtilization"]["Average"], 2)
+            hw_metrics["cpu_max_pct"] = round(hw_metrics["CPUUtilization"]["Maximum"], 2)
+
+        if "FreeableMemory" in hw_metrics:
+            free_bytes = hw_metrics["FreeableMemory"]["Average"]
+            hw_metrics["freeable_ram_gb"] = round(free_bytes / (1024**3), 2)
+            hw_metrics["freeable_ram_mb"] = round(free_bytes / (1024**2), 1)
+            total_ram = specs.get("ram_gb")
+            if total_ram:
+                used_ram = total_ram - hw_metrics["freeable_ram_gb"]
+                hw_metrics["used_ram_gb"] = round(max(0.0, used_ram), 2)
+                hw_metrics["ram_usage_pct"] = round((used_ram / total_ram) * 100, 1)
+
+        if "FreeStorageSpace" in hw_metrics:
+            free_st_bytes = hw_metrics["FreeStorageSpace"]["Average"]
+            hw_metrics["free_storage_gb"] = round(free_st_bytes / (1024**3), 2)
+            if allocated_gb:
+                used_st = allocated_gb - hw_metrics["free_storage_gb"]
+                hw_metrics["used_storage_gb"] = round(max(0.0, used_st), 2)
+                hw_metrics["storage_usage_pct"] = round((used_st / allocated_gb) * 100, 1)
+
+        if "ReadIOPS" in hw_metrics and "WriteIOPS" in hw_metrics:
+            hw_metrics["read_iops"] = round(hw_metrics["ReadIOPS"]["Average"], 1)
+            hw_metrics["write_iops"] = round(hw_metrics["WriteIOPS"]["Average"], 1)
+    except Exception as e:
+        hw_metrics["cw_error"] = str(e)
+
+    results["hardware_metrics"] = hw_metrics
 
     # 2. OS Versions & Patch / Maintenance Details
     maint_window = db.get("PreferredMaintenanceWindow")
@@ -166,13 +312,14 @@ def audit_postgresql(
 ) -> Dict[str, Any]:
     """
     Audits PostgreSQL database instance:
-    1. Cluster-wide databases list, total connections, users/roles
-    2. Connection breakdown across all individual databases
-    3. Multi-database inspection: iterates through each non-template database
-    4. Version and compile info
-    5. Configured port and SSL settings
-    6. Workers running (pg_stat_activity backend types, worker limits)
-    7. Postmaster startup settings
+    1. Cluster-wide databases list, total storage sizes, connections, users/roles
+    2. Engine hardware allocation (shared_buffers, effective_cache_size, tablespaces)
+    3. Buffer cache hit ratio & active CPU computing queries
+    4. Multi-database inspection: iterates through each non-template database
+    5. Version and compile info
+    6. Configured port and SSL settings
+    7. Workers running (pg_stat_activity backend types, worker limits)
+    8. Postmaster startup settings
     """
     try:
         import pg8000.native
@@ -195,6 +342,46 @@ def audit_postgresql(
 
     all_db_names = []
     try:
+        # Hardware Metrics: Engine Storage, Memory, Cache Hit & CPU Queries
+        st_row = con.run("""
+            SELECT pg_size_pretty(sum(pg_database_size(datname))), sum(pg_database_size(datname))
+            FROM pg_database
+            WHERE datistemplate = false;
+        """)[0]
+        ts_rows = con.run("SELECT spcname, pg_size_pretty(pg_tablespace_size(spcname)) FROM pg_tablespace;")
+        mem_rows = con.run("""
+            SELECT name, setting, unit, short_desc 
+            FROM pg_settings 
+            WHERE name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem', 'effective_cache_size', 'temp_buffers');
+        """)
+        cache_row = con.run("""
+            SELECT round(sum(blks_hit)*100.0/nullif(sum(blks_hit + blks_read),0), 2)
+            FROM pg_stat_database;
+        """)[0]
+        act_rows = con.run("""
+            SELECT 
+                count(*) AS total_backends,
+                count(*) FILTER (WHERE state = 'active' AND pid != pg_backend_pid()) AS cpu_computing_queries,
+                count(*) FILTER (WHERE wait_event_type = 'IO') AS io_waiting,
+                count(*) FILTER (WHERE wait_event_type = 'Lock') AS lock_waiting,
+                count(*) FILTER (WHERE state = 'idle') AS idle_sessions
+            FROM pg_stat_activity;
+        """)[0]
+        report["hardware_metrics"] = {
+            "total_database_storage_used": st_row[0],
+            "total_database_storage_bytes": int(st_row[1] or 0),
+            "tablespaces": [{"tablespace": r[0], "size": r[1]} for r in ts_rows],
+            "memory_settings": {r[0]: f"{r[1]} {r[2] or ''}".strip() for r in mem_rows},
+            "cache_hit_ratio_pct": float(cache_row[0]) if cache_row[0] is not None else None,
+            "activity_breakdown": {
+                "total_backends": act_rows[0],
+                "cpu_computing_queries": act_rows[1],
+                "io_waiting": act_rows[2],
+                "lock_waiting": act_rows[3],
+                "idle_sessions": act_rows[4],
+            }
+        }
+
         # 1. Databases across the entire RDS Cluster
         db_rows = con.run("""
             SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size,
@@ -300,7 +487,7 @@ def audit_postgresql(
     finally:
         con.close()
 
-    # Multi-Database Schema & Table Inspection (Iterating through all other databases)
+    # Multi-Database Schema & Table Inspection
     if inspect_all_databases and all_db_names:
         per_database_details = []
         for target_db in all_db_names:
@@ -341,14 +528,7 @@ def audit_postgresql(
 
 
 def audit_mysql(host: str, port: int, user: str, password: str, dbname: str) -> Dict[str, Any]:
-    """
-    Audits MySQL / Aurora MySQL database instance:
-    1. Databases list, total connections, users
-    2. Version details
-    3. Configured port and network variables
-    4. Worker threads running and processlist breakdown
-    5. Startup and non-default global variables
-    """
+    """Audits MySQL / Aurora MySQL database instance."""
     try:
         import pymysql
     except ImportError:
@@ -482,13 +662,67 @@ def format_pretty_report(aws_info: Dict[str, Any], db_info: Dict[str, Any]) -> s
     elif aws_info and "error" in aws_info:
         lines.append(f"\n[!] AWS Infra Fetch Note: {aws_info['error']}")
 
-    # 2. DATABASE ENGINE AUDIT
+    # 2. HARDWARE METRICS: CPU USAGE, STORAGE & RAM USAGE
+    hw_aws = aws_info.get("hardware_metrics", {}) if (aws_info and "error" not in aws_info) else {}
+    hw_sql = db_info.get("hardware_metrics", {}) if (db_info and "error" not in db_info) else {}
+
+    if hw_aws or hw_sql:
+        lines.append("\n" + "-" * 80)
+        lines.append(" INSTANCE HARDWARE METRICS: CPU USAGE, STORAGE & RAM USAGE ".center(80, "-"))
+        lines.append("-" * 80)
+
+        if hw_aws:
+            lines.append("\n[+] AWS CloudWatch Real-Time Host Metrics")
+            host_rows = []
+            if "instance_class_specs" in hw_aws:
+                host_rows.append(["Instance Class", hw_aws["instance_class_specs"].get("label", hw_aws.get("instance_class", "N/A"))])
+            if "allocated_storage_gb" in hw_aws:
+                host_rows.append(["Allocated EBS Storage", f"{hw_aws['allocated_storage_gb']} GB ({hw_aws.get('storage_type', 'gp3')})"])
+            if "free_storage_gb" in hw_aws:
+                host_rows.append(["Free Storage Space (EBS)", f"{hw_aws['free_storage_gb']} GB remaining"])
+            if "used_storage_gb" in hw_aws:
+                host_rows.append(["EBS Storage Used", f"{hw_aws['used_storage_gb']} GB ({hw_aws.get('storage_usage_pct', 'N/A')}%)"])
+            if "cpu_avg_pct" in hw_aws:
+                host_rows.append(["CPU Utilization (Host)", f"Average: {hw_aws['cpu_avg_pct']}% | Peak: {hw_aws.get('cpu_max_pct', 'N/A')}%"])
+            if "instance_class_specs" in hw_aws and hw_aws["instance_class_specs"].get("ram_gb"):
+                host_rows.append(["Total RAM Capacity", f"{hw_aws['instance_class_specs']['ram_gb']:.2f} GB"])
+            if "freeable_ram_gb" in hw_aws:
+                host_rows.append(["Freeable RAM (Host)", f"{hw_aws['freeable_ram_gb']} GB ({hw_aws.get('freeable_ram_mb', 'N/A')} MB freeable)"])
+            if "used_ram_gb" in hw_aws:
+                host_rows.append(["Host RAM Usage (Estimated)", f"{hw_aws['used_ram_gb']} GB ({hw_aws.get('ram_usage_pct', 'N/A')}%)"])
+            if "read_iops" in hw_aws and "write_iops" in hw_aws:
+                host_rows.append(["Disk IOPS", f"Read: {hw_aws['read_iops']} IOPS | Write: {hw_aws['write_iops']} IOPS"])
+            if host_rows:
+                lines.append(tabulate(host_rows, headers=["Host Hardware Metric", "Measured Value"], tablefmt="rounded_grid"))
+
+        if hw_sql:
+            if "total_database_storage_used" in hw_sql:
+                lines.append("\n[+] Database Engine Storage Allocation")
+                lines.append(f"  * Total Storage Consumed Across All Databases: {hw_sql['total_database_storage_used']}")
+                if "tablespaces" in hw_sql:
+                    ts_rows = [[t["tablespace"], t["size"]] for t in hw_sql["tablespaces"]]
+                    lines.append(tabulate(ts_rows, headers=["Tablespace Name", "Disk Space Used"], tablefmt="rounded_grid"))
+
+            if "memory_settings" in hw_sql:
+                lines.append("\n[+] Database RAM Allocation & Cache Performance")
+                mem_table = [[k, v] for k, v in hw_sql["memory_settings"].items()]
+                lines.append(tabulate(mem_table, headers=["Memory Parameter", "Allocated RAM"], tablefmt="rounded_grid"))
+                if hw_sql.get("cache_hit_ratio_pct") is not None:
+                    lines.append(f"  * Buffer Cache Hit Ratio: {hw_sql['cache_hit_ratio_pct']}% (RAM Cache Efficiency - healthy is >99%)")
+
+            if "activity_breakdown" in hw_sql:
+                act = hw_sql["activity_breakdown"]
+                lines.append("\n[+] Database Query Activity & CPU Load Breakdown")
+                act_rows = [[act.get("total_backends"), act.get("cpu_computing_queries"), act.get("io_waiting"), act.get("lock_waiting"), act.get("idle_sessions")]]
+                lines.append(tabulate(act_rows, headers=["Total Backends", "Active CPU Queries", "I/O Waiting", "Lock Waiting", "Idle Sessions"], tablefmt="rounded_grid"))
+
+    # 3. DATABASE ENGINE AUDIT
     if db_info and "error" not in db_info:
         lines.append("\n" + "-" * 80)
         lines.append(" DATABASE ENGINE INTERNAL METRICS ".center(80, "-"))
         lines.append("-" * 80)
 
-        # 1. Databases
+        # Databases
         lines.append(f"\n[+] 1. Databases in RDS Instance (Total: {db_info.get('total_databases_count')})")
         if "databases" in db_info:
             lines.append(tabulate(db_info["databases"], headers="keys", tablefmt="simple"))
@@ -561,24 +795,24 @@ def main():
     parser = argparse.ArgumentParser(
         description="Inspect AWS RDS & Aurora infrastructure and internal database metrics across all databases."
     )
+    # Target preset
+    parser.add_argument("--target", choices=["market", "product", "both"], default="both", help="Target instance preset (market, product, or both)")
+
     # AWS Infra arguments
     parser.add_argument("--db-identifier", help="AWS RDS DB instance or cluster identifier")
     parser.add_argument("--region", default=os.getenv("AWS_REGION", "ap-south-1"), help="AWS Region (default: ap-south-1)")
     parser.add_argument("--skip-aws", action="store_true", help="Skip AWS API calls and only inspect via direct DB connection")
 
     # DB Connection arguments
-    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="Full PostgreSQL / MySQL connection URI")
-    parser.add_argument("--engine", choices=["postgres", "mysql"], default=os.getenv("DB_ENGINE", "postgres"), help="DB engine type")
-    parser.add_argument("--host", default=os.getenv("DB_HOST"), help="Database host / RDS endpoint")
-    parser.add_argument("--port", type=int, default=int(os.getenv("DB_PORT", "0") or "0"), help="Database port")
-    parser.add_argument("--user", default=os.getenv("DB_USER"), help="Database username")
-    parser.add_argument("--password", default=os.getenv("DB_PASSWORD"), help="Database password")
-    parser.add_argument("--dbname", default=os.getenv("DB_NAME"), help="Database name")
+    parser.add_argument("--database-url", help="Full PostgreSQL / MySQL connection URI")
+    parser.add_argument("--engine", choices=["postgres", "mysql"], default="postgres", help="DB engine type")
+    parser.add_argument("--host", help="Database host / RDS endpoint")
+    parser.add_argument("--port", type=int, default=0, help="Database port")
+    parser.add_argument("--user", help="Database username")
+    parser.add_argument("--password", help="Database password")
+    parser.add_argument("--dbname", help="Database name")
     parser.add_argument("--skip-db", action="store_true", help="Skip direct DB connection and only inspect AWS infra")
     parser.add_argument("--no-all-db", action="store_true", help="Do not iterate across all other databases in instance")
-
-    # Target preset
-    parser.add_argument("--target", choices=["market", "product"], help="Select target preset from .env (market or product)")
 
     # Output options
     parser.add_argument("--json", action="store_true", help="Output full report as JSON")
@@ -586,7 +820,18 @@ def main():
 
     args = parser.parse_args()
 
-    # Determine default variables based on --target
+    # If --db-identifier or --database-url is explicitly passed, treat as single target
+    if args.db_identifier or args.database_url or args.host:
+        if args.target == "both":
+            args.target = "custom"
+
+    if args.target == "both":
+        # Run dual instance audit
+        from audit_both_instances import main as run_dual_audit
+        run_dual_audit()
+        return
+
+    # Single instance target resolution
     if args.target == "product":
         default_url = os.getenv("PRODUCT_DATABASE_URL")
         default_user = os.getenv("PRODUCT_DB_USER", "bl_pg_admin")
@@ -595,16 +840,23 @@ def main():
         default_port = int(os.getenv("PRODUCT_DB_PORT", "5432"))
         default_dbname = os.getenv("PRODUCT_DB_NAME", "ag4good_db")
         default_instance = os.getenv("PRODUCT_DB_INSTANCE_IDENTIFIER", "bettrlabsprod")
+    elif args.target == "market":
+        default_url = os.getenv("MARKET_DATABASE_URL") or os.getenv("DATABASE_URL")
+        default_user = os.getenv("MARKET_DB_USER") or os.getenv("DB_USER", "postgres")
+        default_pwd = os.getenv("MARKET_DB_PASSWORD") or os.getenv("DB_PASSWORD")
+        default_host = os.getenv("MARKET_DB_HOST") or os.getenv("DB_HOST", "bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com")
+        default_port = int(os.getenv("MARKET_DB_PORT", "0") or os.getenv("DB_PORT", "0") or "5432")
+        default_dbname = os.getenv("MARKET_DB_NAME") or os.getenv("DB_NAME", "bettrlabs_market_prod")
+        default_instance = os.getenv("MARKET_DB_INSTANCE_IDENTIFIER") or os.getenv("DB_INSTANCE_IDENTIFIER", "bettrlabs-mp-prod")
     else:
-        default_url = os.getenv("DATABASE_URL") or os.getenv("MARKET_DATABASE_URL")
-        default_user = os.getenv("DB_USER") or os.getenv("MARKET_DB_USER")
-        default_pwd = os.getenv("DB_PASSWORD") or os.getenv("MARKET_DB_PASSWORD")
-        default_host = os.getenv("DB_HOST") or os.getenv("MARKET_DB_HOST")
-        default_port = int(os.getenv("DB_PORT", "0") or os.getenv("MARKET_DB_PORT", "0") or "0")
-        default_dbname = os.getenv("DB_NAME") or os.getenv("MARKET_DB_NAME")
-        default_instance = os.getenv("DB_INSTANCE_IDENTIFIER") or os.getenv("MARKET_DB_INSTANCE_IDENTIFIER")
+        default_url = os.getenv("DATABASE_URL")
+        default_user = os.getenv("DB_USER")
+        default_pwd = os.getenv("DB_PASSWORD")
+        default_host = os.getenv("DB_HOST")
+        default_port = int(os.getenv("DB_PORT", "0") or "0")
+        default_dbname = os.getenv("DB_NAME")
+        default_instance = os.getenv("DB_INSTANCE_IDENTIFIER")
 
-    # Parse --database-url if provided or use target default
     host = args.host or default_host
     port = args.port or default_port
     user = args.user or default_user
@@ -613,7 +865,6 @@ def main():
 
     db_url = args.database_url or default_url
     if db_url:
-        # Strip dialect suffixes e.g. postgresql+asyncpg -> postgresql
         clean_url = db_url
         if "+asyncpg" in clean_url:
             clean_url = clean_url.replace("+asyncpg", "")
@@ -644,7 +895,6 @@ def main():
     if not args.skip_aws:
         identifier = args.db_identifier or default_instance or os.getenv("DB_INSTANCE_IDENTIFIER")
         if not identifier and host and ".rds.amazonaws.com" in host:
-            # Extract instance identifier from host prefix (e.g. bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com)
             identifier = host.split(".")[0]
 
         if identifier:

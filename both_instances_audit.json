@@ -1,0 +1,28 @@
+{
+  "marketplace_instance": {
+    "aws": {
+      "instance_id": "bettrlabs-mp-prod",
+      "region": "ap-south-1",
+      "cloudwatch_available": false,
+      "rds_available": false,
+      "rds_error": "AWS RDS Client Error: Unable to locate credentials"
+    },
+    "sql": {
+      "sql_connected": false,
+      "sql_error": "Can't create a connection to host bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com and port 5432 (timeout is 5 and source_address is None)."
+    }
+  },
+  "product_instance": {
+    "aws": {
+      "instance_id": "bettrlabsprod",
+      "region": "ap-south-1",
+      "cloudwatch_available": false,
+      "rds_available": false,
+      "rds_error": "AWS RDS Client Error: Unable to locate credentials"
+    },
+    "sql": {
+      "sql_connected": false,
+      "sql_error": "Can't create a connection to host bettrlabsprod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com and port 5432 (timeout is 5 and source_address is None)."
+    }
+  }
+}
