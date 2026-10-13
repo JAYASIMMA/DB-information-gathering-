@@ -304,45 +304,73 @@ ORDER BY query_start ASC
 LIMIT 5;
 
 \echo '================================================================================'
-\echo ' [4] CONNECTION UTILIZATION & BREAKDOWN'
+\echo ' [4] CONNECTION UTILIZATION & CONNECTION POOL SIZING ACROSS ALL DATABASES'
 \echo '================================================================================'
 SELECT 
     (SELECT count(*) FROM pg_stat_activity) AS current_connections,
-    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_allowed_connections,
+    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS cluster_max_connections,
+    (SELECT setting::int FROM pg_settings WHERE name = 'superuser_reserved_connections') AS superuser_reserved,
+    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') - 
+    (SELECT setting::int FROM pg_settings WHERE name = 'superuser_reserved_connections') AS usable_app_pool_capacity,
     ROUND(
         ((SELECT count(*)::numeric FROM pg_stat_activity) / 
          (SELECT setting::numeric FROM pg_settings WHERE name = 'max_connections')) * 100, 2
-    ) AS connection_usage_percent;
+    ) AS cluster_pool_usage_percent;
 
-\echo '--- Connections Grouped by Database ---'
+\echo '--- Connection Pool Capacity and Utilization Across ALL Databases ---'
+SELECT 
+    d.datname AS database_name,
+    CASE 
+        WHEN d.datconnlimit > 0 THEN d.datconnlimit::text
+        ELSE (SELECT setting FROM pg_settings WHERE name = 'max_connections') || ' (cluster max)'
+    END AS configured_pool_limit,
+    count(a.pid) AS total_connected,
+    count(a.pid) FILTER (WHERE a.state = 'active') AS active_in_use,
+    count(a.pid) FILTER (WHERE a.state = 'idle') AS idle_in_pool,
+    count(a.pid) FILTER (WHERE a.state = 'idle in transaction') AS idle_in_tx,
+    ROUND(
+        count(a.pid)::numeric * 100.0 / 
+        CASE 
+            WHEN d.datconnlimit > 0 THEN d.datconnlimit::numeric
+            ELSE (SELECT setting::numeric FROM pg_settings WHERE name = 'max_connections')
+        END, 2
+    ) AS pool_utilization_pct
+FROM pg_database d
+LEFT JOIN pg_stat_activity a ON d.datname = a.datname
+WHERE d.datistemplate = false
+GROUP BY d.datname, d.datconnlimit
+ORDER BY total_connected DESC;
+
+\echo '--- Connection Pool Breakdown by Application / Pooler & Database ---'
 SELECT 
     COALESCE(datname, '[Cluster Worker / Background]') AS database_name,
-    count(*) AS total_connections,
-    count(*) FILTER (WHERE state = 'active') AS active_queries,
-    count(*) FILTER (WHERE state = 'idle') AS idle_connections,
+    COALESCE(NULLIF(application_name, ''), '[unnamed / pooler]') AS client_app_or_pooler,
+    COALESCE(usename, '[internal]') AS db_user,
+    COALESCE(client_addr::text, 'localhost / internal') AS client_ip,
+    count(*) AS pool_connections,
+    count(*) FILTER (WHERE state = 'active') AS active,
+    count(*) FILTER (WHERE state = 'idle') AS idle_in_pool,
     count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_tx
 FROM pg_stat_activity
-GROUP BY datname
-ORDER BY total_connections DESC;
+GROUP BY datname, application_name, usename, client_addr
+ORDER BY pool_connections DESC
+LIMIT 15;
 
-\echo '--- Connections Grouped by User Role ---'
+\echo '--- Connection Pool Limits by User Role ---'
 SELECT 
-    COALESCE(usename, '[Internal Background]') AS username,
-    count(*) AS total_connections,
-    count(*) FILTER (WHERE state = 'active') AS active,
-    count(*) FILTER (WHERE state = 'idle') AS idle
-FROM pg_stat_activity
-GROUP BY usename
-ORDER BY total_connections DESC;
-
-\echo '--- Connections Grouped by Client IP Host ---'
-SELECT 
-    COALESCE(client_addr::text, 'localhost / internal') AS client_ip,
-    count(*) AS connections_from_ip
-FROM pg_stat_activity
-GROUP BY client_addr
-ORDER BY connections_from_ip DESC
-LIMIT 10;
+    r.rolname AS username,
+    CASE 
+        WHEN r.rolconnlimit >= 0 THEN r.rolconnlimit::text 
+        ELSE (SELECT setting FROM pg_settings WHERE name = 'max_connections') || ' (cluster max)' 
+    END AS user_pool_limit,
+    count(a.pid) AS total_connections,
+    count(a.pid) FILTER (WHERE state = 'active') AS active,
+    count(a.pid) FILTER (WHERE state = 'idle') AS idle_in_pool
+FROM pg_roles r
+LEFT JOIN pg_stat_activity a ON r.rolname = a.usename
+WHERE r.rolcanlogin = true
+GROUP BY r.rolname, r.rolconnlimit
+ORDER BY total_connections DESC, r.rolname;
 
 \echo '================================================================================'
 \echo ' [5] DATABASE USERS, ROLES & SECURITY PERMISSIONS'
@@ -480,21 +508,21 @@ PR_NAME="${PRODUCT_DB_NAME:-ag4good_db}"
 audit_instance "Production Core DB (bettrlabsprod)" "$PR_HOST" "$PR_PORT" "$PR_USER" "$PR_PWD" "$PR_NAME"
 
 # ------------------------------------------------------------------------------
-# 3. Consolidated Cross-Instance Database Summary
+# 3. Consolidated Cross-Instance Database & Connection Pool Summary
 # ------------------------------------------------------------------------------
 log_echo "\n================================================================================"
-log_echo " CONSOLIDATED SUMMARY: ALL DATABASES PRESENT ACROSS BOTH INSTANCES"
+log_echo " CONSOLIDATED SUMMARY: ALL DATABASES & CONNECTION POOLS ACROSS BOTH INSTANCES"
 log_echo "================================================================================"
 
-log_echo "\n[+] Databases on Marketplace RDS (bettrlabs-mp-prod):"
+log_echo "\n[+] Databases & Pool Sizing on Marketplace RDS (bettrlabs-mp-prod):"
 export PGPASSWORD="$MP_PWD"
 psql -h "$MP_HOST" -p "$MP_PORT" -U "$MP_USER" -d "$MP_NAME" -c \
-    "SELECT datname AS database_name, pg_catalog.pg_get_userbyid(datdba) AS owner, pg_size_pretty(pg_database_size(datname)) AS size, (SELECT count(*) FROM pg_stat_activity WHERE datname = d.datname) AS conns FROM pg_database d WHERE datistemplate = false ORDER BY pg_database_size(datname) DESC;" 2>/dev/null | tee -a "${LOG_FILE}" || log_echo "    [!] Could not retrieve summary for Marketplace RDS."
+    "SELECT d.datname AS database_name, pg_size_pretty(pg_database_size(d.datname)) AS db_size, CASE WHEN d.datconnlimit > 0 THEN d.datconnlimit::text ELSE (SELECT setting FROM pg_settings WHERE name = 'max_connections') || ' (max)' END AS pool_limit, count(a.pid) AS total_connected, count(a.pid) FILTER (WHERE a.state = 'active') AS active_in_use, count(a.pid) FILTER (WHERE a.state = 'idle') AS idle_in_pool, ROUND(count(a.pid)::numeric * 100.0 / CASE WHEN d.datconnlimit > 0 THEN d.datconnlimit::numeric ELSE (SELECT setting::numeric FROM pg_settings WHERE name = 'max_connections') END, 2) AS pool_used_pct FROM pg_database d LEFT JOIN pg_stat_activity a ON d.datname = a.datname WHERE d.datistemplate = false GROUP BY d.datname, d.datconnlimit ORDER BY pg_database_size(d.datname) DESC;" 2>/dev/null | tee -a "${LOG_FILE}" || log_echo "    [!] Could not retrieve summary for Marketplace RDS."
 
-log_echo "\n[+] Databases on Production Core DB (bettrlabsprod):"
+log_echo "\n[+] Databases & Pool Sizing on Production Core DB (bettrlabsprod):"
 export PGPASSWORD="$PR_PWD"
 psql -h "$PR_HOST" -p "$PR_PORT" -U "$PR_USER" -d "$PR_NAME" -c \
-    "SELECT datname AS database_name, pg_catalog.pg_get_userbyid(datdba) AS owner, pg_size_pretty(pg_database_size(datname)) AS size, (SELECT count(*) FROM pg_stat_activity WHERE datname = d.datname) AS conns FROM pg_database d WHERE datistemplate = false ORDER BY pg_database_size(datname) DESC;" 2>/dev/null | tee -a "${LOG_FILE}" || log_echo "    [!] Could not retrieve summary for Production Core DB."
+    "SELECT d.datname AS database_name, pg_size_pretty(pg_database_size(d.datname)) AS db_size, CASE WHEN d.datconnlimit > 0 THEN d.datconnlimit::text ELSE (SELECT setting FROM pg_settings WHERE name = 'max_connections') || ' (max)' END AS pool_limit, count(a.pid) AS total_connected, count(a.pid) FILTER (WHERE a.state = 'active') AS active_in_use, count(a.pid) FILTER (WHERE a.state = 'idle') AS idle_in_pool, ROUND(count(a.pid)::numeric * 100.0 / CASE WHEN d.datconnlimit > 0 THEN d.datconnlimit::numeric ELSE (SELECT setting::numeric FROM pg_settings WHERE name = 'max_connections') END, 2) AS pool_used_pct FROM pg_database d LEFT JOIN pg_stat_activity a ON d.datname = a.datname WHERE d.datistemplate = false GROUP BY d.datname, d.datconnlimit ORDER BY pg_database_size(d.datname) DESC;" 2>/dev/null | tee -a "${LOG_FILE}" || log_echo "    [!] Could not retrieve summary for Production Core DB."
 unset PGPASSWORD
 
 # ------------------------------------------------------------------------------
