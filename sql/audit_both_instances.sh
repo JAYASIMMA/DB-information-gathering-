@@ -119,19 +119,128 @@ FROM pg_database
 WHERE datistemplate = false;
 
 SELECT 
-    datname AS database_name,
-    pg_size_pretty(pg_database_size(datname)) AS database_size,
-    pg_encoding_to_char(encoding) AS encoding,
-    datcollate AS collation
-FROM pg_database
-WHERE datistemplate = false
-ORDER BY pg_database_size(datname) DESC;
+    d.datname AS database_name,
+    pg_catalog.pg_get_userbyid(d.datdba) AS database_owner,
+    pg_size_pretty(pg_database_size(d.datname)) AS database_size,
+    pg_encoding_to_char(d.encoding) AS encoding,
+    d.datcollate AS collation,
+    d.datconnlimit AS connection_limit,
+    (SELECT count(*) FROM pg_stat_activity a WHERE a.datname = d.datname) AS current_connections
+FROM pg_database d
+WHERE d.datistemplate = false
+ORDER BY pg_database_size(d.datname) DESC;
 
 \echo '--- Tablespace Allocation ---'
 SELECT 
     spcname AS tablespace_name,
     pg_size_pretty(pg_tablespace_size(spcname)) AS allocated_size
 FROM pg_tablespace;
+EOF
+
+    # --------------------------------------------------------------------------
+    # Discover and Deep-Audit Every Non-Template Database on This Instance
+    # --------------------------------------------------------------------------
+    local DATABASES
+    DATABASES=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -A -c \
+        "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('template0', 'template1') ORDER BY pg_database_size(datname) DESC;" 2>/dev/null || true)
+
+    log_echo "\n================================================================================"
+    log_echo " [*] ALL DATABASES DISCOVERED ON ${INSTANCE_LABEL}:"
+    log_echo "================================================================================"
+    if [ -n "$DATABASES" ]; then
+        for db in $DATABASES; do
+            log_echo "  [+] Database: ${db}"
+        done
+
+        log_echo "\n================================================================================"
+        log_echo " [*] DEEP AUDIT FOR EACH DISCOVERED DATABASE ON ${INSTANCE_LABEL}:"
+        log_echo "================================================================================"
+        for db in $DATABASES; do
+            log_echo "\n--------------------------------------------------------------------------------"
+            log_echo " >>> Database: [ ${db} ] on ${INSTANCE_LABEL} <<<"
+            log_echo "--------------------------------------------------------------------------------"
+
+            # Check if user has permission to connect to this specific database
+            if ! psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$db" -c "SELECT 1;" > /dev/null 2>&1; then
+                log_echo " [!] Notice: Cannot connect to '${db}' using user '${DB_USER}' (Insufficient privileges or maintenance DB)."
+                continue
+            fi
+
+            psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$db" << 'EOFDB' | tee -a "${LOG_FILE}"
+\timing off
+\x off
+\echo '--- Database Size & Schema / Table Counts ---'
+SELECT 
+    current_database() AS database_name,
+    pg_size_pretty(pg_database_size(current_database())) AS total_size,
+    (SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema')) AS user_tables_count,
+    (SELECT count(DISTINCT table_schema) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema')) AS user_schemas_count;
+
+\echo '--- User Schemas in Database ---'
+SELECT 
+    schema_name,
+    schema_owner
+FROM information_schema.schemata
+WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+ORDER BY schema_name;
+
+\echo '--- Top 10 Largest Tables in This Database ---'
+SELECT 
+    schemaname || '.' || relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    pg_size_pretty(pg_relation_size(relid)) AS table_data_size,
+    pg_size_pretty(pg_total_relation_size(relid) - pg_relation_size(relid)) AS index_toast_size,
+    n_live_tup AS estimated_live_rows,
+    n_dead_tup AS estimated_dead_rows
+FROM pg_stat_user_tables
+ORDER BY pg_total_relation_size(relid) DESC
+LIMIT 10;
+
+\echo '--- Connection Pool Sizing & Usage for This Database ---'
+SELECT 
+    current_database() AS database_name,
+    CASE 
+        WHEN (SELECT datconnlimit FROM pg_database WHERE datname = current_database()) > 0 
+        THEN (SELECT datconnlimit::text FROM pg_database WHERE datname = current_database())
+        ELSE (SELECT setting FROM pg_settings WHERE name = 'max_connections') || ' (instance max)'
+    END AS configured_pool_limit,
+    count(*) AS total_pool_connections,
+    count(*) FILTER (WHERE state = 'active') AS active_in_use,
+    count(*) FILTER (WHERE state = 'idle') AS idle_in_pool,
+    count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_tx,
+    ROUND(
+        count(*)::numeric * 100.0 / 
+        CASE 
+            WHEN (SELECT datconnlimit FROM pg_database WHERE datname = current_database()) > 0 
+            THEN (SELECT datconnlimit::numeric FROM pg_database WHERE datname = current_database())
+            ELSE (SELECT setting::numeric FROM pg_settings WHERE name = 'max_connections')
+        END, 2
+    ) AS pool_utilization_pct
+FROM pg_stat_activity
+WHERE datname = current_database();
+
+\echo '--- Application & Pooler Breakdown for This Database ---'
+SELECT 
+    COALESCE(NULLIF(application_name, ''), '[unnamed app / pooler]') AS client_app_or_pooler,
+    usename AS db_user,
+    COALESCE(client_addr::text, 'local') AS client_ip,
+    count(*) AS pooled_connections,
+    count(*) FILTER (WHERE state = 'active') AS active,
+    count(*) FILTER (WHERE state = 'idle') AS idle
+FROM pg_stat_activity
+WHERE datname = current_database()
+GROUP BY application_name, usename, client_addr
+ORDER BY pooled_connections DESC;
+EOFDB
+        done
+    else
+        log_echo " [!] Could not list databases for ${INSTANCE_LABEL}."
+    fi
+
+    # Continue with cluster-level metrics
+    psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" << 'EOF' | tee -a "${LOG_FILE}"
+\timing off
+\x off
 
 \echo '================================================================================'
 \echo ' [2] RAM MEMORY SETTINGS & BUFFER CACHE EFFICIENCY'
@@ -371,9 +480,28 @@ PR_NAME="${PRODUCT_DB_NAME:-ag4good_db}"
 audit_instance "Production Core DB (bettrlabsprod)" "$PR_HOST" "$PR_PORT" "$PR_USER" "$PR_PWD" "$PR_NAME"
 
 # ------------------------------------------------------------------------------
+# 3. Consolidated Cross-Instance Database Summary
+# ------------------------------------------------------------------------------
+log_echo "\n================================================================================"
+log_echo " CONSOLIDATED SUMMARY: ALL DATABASES PRESENT ACROSS BOTH INSTANCES"
+log_echo "================================================================================"
+
+log_echo "\n[+] Databases on Marketplace RDS (bettrlabs-mp-prod):"
+export PGPASSWORD="$MP_PWD"
+psql -h "$MP_HOST" -p "$MP_PORT" -U "$MP_USER" -d "$MP_NAME" -c \
+    "SELECT datname AS database_name, pg_catalog.pg_get_userbyid(datdba) AS owner, pg_size_pretty(pg_database_size(datname)) AS size, (SELECT count(*) FROM pg_stat_activity WHERE datname = d.datname) AS conns FROM pg_database d WHERE datistemplate = false ORDER BY pg_database_size(datname) DESC;" 2>/dev/null | tee -a "${LOG_FILE}" || log_echo "    [!] Could not retrieve summary for Marketplace RDS."
+
+log_echo "\n[+] Databases on Production Core DB (bettrlabsprod):"
+export PGPASSWORD="$PR_PWD"
+psql -h "$PR_HOST" -p "$PR_PORT" -U "$PR_USER" -d "$PR_NAME" -c \
+    "SELECT datname AS database_name, pg_catalog.pg_get_userbyid(datdba) AS owner, pg_size_pretty(pg_database_size(datname)) AS size, (SELECT count(*) FROM pg_stat_activity WHERE datname = d.datname) AS conns FROM pg_database d WHERE datistemplate = false ORDER BY pg_database_size(datname) DESC;" 2>/dev/null | tee -a "${LOG_FILE}" || log_echo "    [!] Could not retrieve summary for Production Core DB."
+unset PGPASSWORD
+
+# ------------------------------------------------------------------------------
 # Completion Notice
 # ------------------------------------------------------------------------------
 log_echo "\n================================================================================"
 log_echo " [✓] Dual Instance Audit Finished."
 log_echo " Detailed log successfully written to: ${LOG_FILE}"
 log_echo "================================================================================"
+
