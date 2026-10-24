@@ -4,7 +4,7 @@
 # Connects to AWS RDS PostgreSQL and runs audits across ALL databases in the instance.
 # Usage:
 #   chmod +x sql/inspect_all_databases.sh
-#   ./sql/inspect_all_databases.sh "postgresql://postgres:9nj-Ahng5FCbdfjdsbcdggbj*7VGgbj@bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com/bettrlabs_market_prod"
+#   ./sql/inspect_all_databases.sh "postgresql://<user>:<password>@<host>:5432/<database>"
 # ==============================================================================
 
 set -e

@@ -1,0 +1,14 @@
+{
+  "status": "SUCCESS",
+  "audit_id": 2,
+  "storage_database": "e34data78",
+  "instance_host": "34.93.217.164:5432",
+  "environment": "development",
+  "cluster_name": "Dev Database Cluster",
+  "engine_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+  "total_databases_recorded": 23,
+  "total_tables_stored": 837,
+  "total_users_stored": 17,
+  "total_settings_stored": 83,
+  "total_cluster_storage": "7934 MB"
+}

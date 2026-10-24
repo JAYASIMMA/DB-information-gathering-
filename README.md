@@ -28,15 +28,32 @@ uv run main.py --db-identifier my-db-instance --region ap-south-1 --engine postg
 
 ## Multi-Database Ingestion into PostgreSQL (`e34data78`)
 
-To audit all databases on a cluster (e.g. `34.100.237.205:5432`) and persist all instance metrics, configurations, database catalogs, and every individual table across all databases into `e34data78`:
+The canonical collector audits both the Dev and UAT PostgreSQL clusters, discovers every non-template database from `pg_database`, collects cluster/database/table metadata, and stores a timestamped snapshot in the central `e34data78` database. Configure `DEV_DATABASE_URL`, `UAT_DATABASE_URL`, and `STORAGE_DATABASE_URL` in a local `.env` file using `.env.example` as the template.
 
 ```bash
-# 1. Run using .env credentials
-uv run store_all_dbs_to_e34data78.py
+# Validate configuration without opening database connections
+uv run collect_dev_uat_db_info.py --dry-run
 
-# 2. Or pass a custom database connection string (supports standard and postgresql+asyncpg://)
-uv run store_all_dbs_to_e34data78.py --url "postgresql://postgres:gvufvjfvavVASVJVAHSVDhbbvjhdUAThbBEttr@34.100.237.205:5432" --target-db e34data78
+# Run both environments once
+uv run collect_dev_uat_db_info.py
+
+# Compatibility entry point
+uv run audit_both_dbs.py
 ```
+
+The runner continues with Dev if UAT fails (and vice versa), returns exit code `1` when either environment fails, and prevents overlapping executions with a lock file. It does not accept passwords as command-line arguments.
+
+### Cron scheduling
+
+On a Linux host, make the wrappers executable and install the nightly 02:00 UTC job. The installer replaces only its own marked entry and preserves other user cron jobs:
+
+```bash
+chmod 700 audit_both_dbs.sh install_db_collector_cron.sh
+./install_db_collector_cron.sh
+crontab -l
+```
+
+Logs are written to `logs/db-collector-cron.log`; the machine-readable summary is written to `logs/db-collector-summary.json`. Keep `.env` readable only by the account running the job (`chmod 600 .env`).
 
 ### Central Schema in `e34data78`
 - `db_instance_audits`: Master audit sessions, engine version, total storage, uptime, connections, CPU/cache hit load.

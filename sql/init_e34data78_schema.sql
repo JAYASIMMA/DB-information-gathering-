@@ -138,7 +138,11 @@ CREATE TABLE IF NOT EXISTS db_database_active_queries (
 CREATE INDEX IF NOT EXISTS idx_active_queries_audit_id ON db_database_active_queries (audit_id);
 CREATE INDEX IF NOT EXISTS idx_active_queries_dbname ON db_database_active_queries (database_name);
 
+ALTER TABLE db_instance_audits ADD COLUMN IF NOT EXISTS environment_profile VARCHAR(64);
+ALTER TABLE db_instance_audits ADD COLUMN IF NOT EXISTS instance_name VARCHAR(128);
+
 -- 7. Analytical Convenience Views
+DROP VIEW IF EXISTS v_all_databases_summary CASCADE;
 CREATE OR REPLACE VIEW v_all_databases_summary AS
 SELECT 
     a.id AS audit_id,

@@ -21,7 +21,7 @@ fi
 DB_HOST="${PRODUCT_DB_HOST:-bettrlabsprod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com}"
 DB_PORT="${PRODUCT_DB_PORT:-5432}"
 DB_USER="${PRODUCT_DB_USER:-bl_pg_admin}"
-DB_PWD="${PRODUCT_DB_PWD:-${PRODUCT_DB_PASSWORD:-7oRfnIND467GrxOIArQw}}"
+DB_PWD="${PRODUCT_DB_PWD:-${PRODUCT_DB_PASSWORD:?PRODUCT_DB_PASSWORD or PRODUCT_DB_PWD must be set}}"
 DB_NAME="${PRODUCT_DB_NAME:-ag4good_db}"
 
 export PGPASSWORD="$DB_PWD"

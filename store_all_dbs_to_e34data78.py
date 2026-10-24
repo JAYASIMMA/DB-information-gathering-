@@ -3,16 +3,17 @@
 Multi-Database Discovery & Insertion Engine for e34data78
 =========================================================
 Audits all databases, instance metrics, user tables, connections, and configuration
-across a PostgreSQL instance and stores all the gathered information into a dedicated
-database named 'e34data78'.
+across PostgreSQL database instances (UAT on 34.100.237.205 and Dev on 34.93.217.164)
+and stores all gathered information into the central storage database named 'e34data78'.
 
 Features:
 - Seamlessly handles standard 'postgresql://' as well as 'postgresql+asyncpg://' URLs.
-- Supports individual DB_HOST, DB_PORT, DB_USER, DB_PWD / DB_PASSWORD credentials.
-- Automatically ensures the target database 'e34data78' exists (creates it if missing).
+- Supports UAT database (34.100.237.205) and Dev database (34.93.217.164) out of the box.
+- Independent separation of the source cluster being audited and the target storage database (e34data78).
 - Automatically initializes the relational storage schema in 'e34data78' (tables, indexes, views).
-- Connects to every discovered database on the instance (e.g. sarla-uat, bettrlabs_marketplace_uat, etc.)
+- Connects to every discovered database on the instance (e.g. sarla-uat, bettrlabs, consumer_dev, etc.).
 - Inserts comprehensive instance-level and per-database table details into 'e34data78'.
+- Automatically syncs with the backend telemetry cache.
 """
 
 import os
@@ -20,6 +21,7 @@ import sys
 import json
 import argparse
 import datetime
+import urllib.request
 from urllib.parse import urlparse, unquote
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -47,6 +49,16 @@ except ImportError:
     HAS_TABULATE = False
 
 
+# ANSI terminal colors
+RESET = "\033[0m"
+BOLD = "\033[1m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+GRAY = "\033[90m"
+
+
 def print_table(rows, headers):
     if HAS_TABULATE:
         return tabulate(rows, headers=headers, tablefmt="rounded_grid")
@@ -57,8 +69,36 @@ def print_table(rows, headers):
 
 
 # ==============================================================================
-# CONFIGURATION & CREDENTIAL PARSER
+# KNOWN DATABASE CLUSTER REGISTRY
 # ==============================================================================
+CLUSTERS_REGISTRY = {
+    "uat": {
+        "key": "uat",
+        "name": "UAT Database Cluster",
+        "environment": "uat",
+        "url_env": "UAT_DATABASE_URL",
+        "host_env": "UAT_DB_HOST",
+        "port_env": "UAT_DB_PORT",
+        "user_env": "UAT_DB_USER",
+        "password_env": "UAT_DB_PASSWORD",
+        "admin_db_env": "UAT_DB_ADMIN_DATABASE",
+    },
+    "dev": {
+        "key": "dev",
+        "name": "Dev Database Cluster",
+        "environment": "development",
+        "url_env": "DEV_DATABASE_URL",
+        "host_env": "DEV_DB_HOST",
+        "port_env": "DEV_DB_PORT",
+        "user_env": "DEV_DB_USER",
+        "password_env": "DEV_DB_PASSWORD",
+        "admin_db_env": "DEV_DB_ADMIN_DATABASE",
+    },
+}
+
+# Credentials must come from the environment or an explicitly supplied URL.
+# Never put passwords in this source file, CLI arguments, or cron definitions.
+
 
 def clean_database_url(url: str) -> str:
     """Normalize asyncpg, psql, or custom prefixes into standard postgresql format."""
@@ -72,45 +112,72 @@ def clean_database_url(url: str) -> str:
     return clean
 
 
-def parse_db_credentials(custom_url: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Extracts database connection parameters from URL or environment variables.
-    Handles DATABASE_URL, DB_HOST, DB_PORT, DB_USER, DB_PWD, DB_PASSWORD.
-    """
-    db_url = custom_url or os.getenv("DATABASE_URL") or os.getenv("DEV_DATABASE_URL") or os.getenv("UAT_DATABASE_URL")
-    
-    # Defaults from provided specs
-    default_host = os.getenv("DB_HOST", "34.100.237.205")
-    default_port = int(os.getenv("DB_PORT", "5432"))
-    default_user = os.getenv("DB_USER", "postgres")
-    default_password = os.getenv("DB_PWD") or os.getenv("DB_PASSWORD", "gvufvjfvavVASVJVAHSVDhbbvjhdUAThbBEttr")
-    storage_db = os.getenv("TARGET_STORAGE_DB", "e34data78")
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ValueError(f"Required environment variable {name} is not set")
+    return value
 
-    if db_url:
-        cleaned_url = clean_database_url(db_url)
-        parsed = urlparse(cleaned_url)
-        user = unquote(parsed.username) if parsed.username else default_user
-        password = unquote(parsed.password) if parsed.password else default_password
-        host = parsed.hostname or default_host
-        port = parsed.port or default_port
-        admin_db = parsed.path.lstrip("/").strip() if parsed.path else "postgres"
-        if not admin_db:
-            admin_db = "postgres"
+
+def _parse_database_url(url: str, *, default_db: str = "postgres") -> Dict[str, Any]:
+    cleaned = clean_database_url(url)
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"postgresql", "postgres"} or not parsed.hostname:
+        raise ValueError("Database URL must use postgresql:// and include a host")
+    if not parsed.username or parsed.password is None:
+        raise ValueError("Database URL must include a username and password")
+    return {
+        "host": parsed.hostname,
+        "port": parsed.port or 5432,
+        "user": unquote(parsed.username),
+        "password": unquote(parsed.password),
+        "admin_db": parsed.path.lstrip("/").strip() or default_db,
+    }
+
+
+def parse_db_credentials(custom_url: Optional[str] = None, target: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve one cluster from an explicit URL or its environment-specific variables."""
+    key = (target or "").lower()
+    if key not in CLUSTERS_REGISTRY:
+        raise ValueError("target must be either 'dev' or 'uat'")
+
+    reg = CLUSTERS_REGISTRY[key]
+    url = custom_url or os.getenv(reg["url_env"], "").strip()
+    if url:
+        connection = _parse_database_url(url)
     else:
-        user = default_user
-        password = default_password
-        host = default_host
-        port = default_port
-        admin_db = "postgres"
+        connection = {
+            "host": _required_env(reg["host_env"]),
+            "port": int(os.getenv(reg["port_env"], "5432")),
+            "user": _required_env(reg["user_env"]),
+            "password": _required_env(reg["password_env"]),
+            "admin_db": os.getenv(reg["admin_db_env"], "postgres").strip() or "postgres",
+        }
 
     return {
-        "host": host,
-        "port": port,
-        "user": user,
-        "password": password,
-        "admin_db": admin_db,
-        "storage_db": storage_db,
+        "key": reg["key"],
+        "name": reg["name"],
+        "environment": reg["environment"],
+        **connection,
     }
+
+
+def parse_storage_credentials(custom_storage_url: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve the central warehouse connection without any credential fallback."""
+    storage_url = custom_storage_url or os.getenv("STORAGE_DATABASE_URL", "").strip()
+    if storage_url:
+        connection = _parse_database_url(storage_url, default_db=os.getenv("TARGET_STORAGE_DB", "e34data78"))
+        storage_db = connection.pop("admin_db")
+    else:
+        connection = {
+            "host": _required_env("STORAGE_DB_HOST"),
+            "port": int(os.getenv("STORAGE_DB_PORT", "5432")),
+            "user": _required_env("STORAGE_DB_USER"),
+            "password": _required_env("STORAGE_DB_PASSWORD"),
+        }
+        storage_db = _required_env("TARGET_STORAGE_DB")
+
+    return {**connection, "storage_db": storage_db}
 
 
 def get_pg_connection(user: str, password: str, host: str, port: int, database: str, timeout: int = 10):
@@ -119,7 +186,6 @@ def get_pg_connection(user: str, password: str, host: str, port: int, database: 
     for seamless cloud/EC2/RDS compatibility.
     """
     try:
-        # First attempt: standard connection without enforcing SSL
         return pg8000.native.Connection(
             user=user,
             password=password,
@@ -131,7 +197,6 @@ def get_pg_connection(user: str, password: str, host: str, port: int, database: 
         )
     except Exception as e_plain:
         try:
-            # Second attempt: with SSL context
             return pg8000.native.Connection(
                 user=user,
                 password=password,
@@ -173,6 +238,8 @@ CREATE TABLE IF NOT EXISTS db_instance_audits (
     io_waiting_queries INT DEFAULT 0,
     lock_waiting_queries INT DEFAULT 0,
     raw_json_summary JSONB,
+    environment_profile VARCHAR(64),
+    instance_name VARCHAR(128),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -280,10 +347,15 @@ CREATE TABLE IF NOT EXISTS db_database_active_queries (
 CREATE INDEX IF NOT EXISTS idx_active_queries_audit_id ON db_database_active_queries (audit_id);
 CREATE INDEX IF NOT EXISTS idx_active_queries_dbname ON db_database_active_queries (database_name);
 
+ALTER TABLE db_instance_audits ADD COLUMN IF NOT EXISTS environment_profile VARCHAR(64);
+ALTER TABLE db_instance_audits ADD COLUMN IF NOT EXISTS instance_name VARCHAR(128);
+
+DROP VIEW IF EXISTS v_all_databases_summary CASCADE;
 CREATE OR REPLACE VIEW v_all_databases_summary AS
 SELECT 
     a.id AS audit_id,
     a.audit_timestamp,
+    a.host AS cluster_host,
     c.database_name,
     c.disk_size_pretty,
     c.disk_size_bytes,
@@ -298,6 +370,7 @@ FROM db_database_catalog c
 JOIN db_instance_audits a ON c.audit_id = a.id
 ORDER BY a.audit_timestamp DESC, c.disk_size_bytes DESC;
 
+DROP VIEW IF EXISTS v_largest_tables_cross_db CASCADE;
 CREATE OR REPLACE VIEW v_largest_tables_cross_db AS
 SELECT 
     t.audit_id,
@@ -315,19 +388,18 @@ ORDER BY t.audit_id DESC, t.total_size_bytes DESC;
 """
 
 
-def ensure_target_db_and_schema(creds: Dict[str, Any]) -> None:
-    """Verifies that the target storage database exists, creates it if missing, and initializes schema."""
-    host = creds["host"]
-    port = creds["port"]
-    user = creds["user"]
-    password = creds["password"]
-    admin_db = creds["admin_db"]
-    storage_db = creds["storage_db"]
+def ensure_target_db_and_schema(storage_creds: Dict[str, Any]):
+    """Connects to the storage host, ensures target DB exists, and runs DDL statements."""
+    host = storage_creds["host"]
+    port = storage_creds["port"]
+    user = storage_creds["user"]
+    password = storage_creds["password"]
+    storage_db = storage_creds["storage_db"]
 
     print(f"\n[*] Checking target storage database '{storage_db}' on {host}:{port}...")
     
-    # 1. Connect to admin DB to check existence of target storage DB
-    con = get_pg_connection(user, password, host, port, admin_db)
+    # 1. Connect to postgres admin db to verify database exists
+    con = get_pg_connection(user, password, host, port, "postgres")
     try:
         check_q = f"SELECT 1 FROM pg_database WHERE datname = '{storage_db}'"
         exists = len(con.run(check_q)) > 0
@@ -344,7 +416,6 @@ def ensure_target_db_and_schema(creds: Dict[str, Any]) -> None:
     print(f"[*] Ensuring storage schema and tables exist in '{storage_db}'...")
     store_con = get_pg_connection(user, password, host, port, storage_db)
     try:
-        # Split statements and run each
         statements = [stmt.strip() for stmt in SCHEMA_SQL.split(";") if stmt.strip()]
         for stmt in statements:
             store_con.run(stmt)
@@ -357,34 +428,46 @@ def ensure_target_db_and_schema(creds: Dict[str, Any]) -> None:
 # AUDIT AND INSERTION PIPELINE
 # ==============================================================================
 
-def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, Any]:
+def execute_discovery_and_store(
+    source_url: Optional[str] = None,
+    target_name: Optional[str] = None,
+    storage_url: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Main execution pipeline:
-    1. Connects to primary cluster.
+    1. Connects to primary cluster to audit.
     2. Collects hardware, settings, users, and version info.
-    3. Gathers all other databases and per-database tables.
+    3. Gathers all databases and per-database tables.
     4. Inserts all collected data into 'e34data78'.
+    5. Syncs the backend cache.
     """
-    creds = parse_db_credentials(custom_url)
-    host = creds["host"]
-    port = creds["port"]
-    user = creds["user"]
-    password = creds["password"]
-    admin_db = creds["admin_db"]
-    storage_db = creds["storage_db"]
+    source_creds = parse_db_credentials(custom_url=source_url, target=target_name)
+    storage_creds = parse_storage_credentials(custom_storage_url=storage_url)
+
+    s_host = source_creds["host"]
+    s_port = source_creds["port"]
+    s_user = source_creds["user"]
+    s_pwd = source_creds["password"]
+    s_admin_db = source_creds["admin_db"]
+    cluster_title = source_creds["name"]
+    cluster_env = source_creds["environment"]
+
+    t_host = storage_creds["host"]
+    t_port = storage_creds["port"]
+    t_db = storage_creds["storage_db"]
 
     print("=" * 85)
-    print(f" DATABASE AUDIT & DATA INGESTION ENGINE -> {storage_db} ".center(85, "="))
-    print(f" Target Instance: {host}:{port} | Admin DB: {admin_db} ".center(85, " "))
-    print(f" Target Storage : {storage_db} ".center(85, " "))
+    print(f" DATABASE AUDIT & DATA INGESTION ENGINE -> {t_db} ".center(85, "="))
+    print(f" Source Cluster: {cluster_title} ({s_host}:{s_port}) ".center(85, " "))
+    print(f" Target Storage: {t_db} on {t_host}:{t_port} ".center(85, " "))
     print("=" * 85)
 
     # 1. Ensure storage DB and schema are ready
-    ensure_target_db_and_schema(creds)
+    ensure_target_db_and_schema(storage_creds)
 
     # 2. Connect to the cluster via admin_db to collect instance-wide metrics
-    print(f"\n[*] Connecting to cluster via '{admin_db}' to collect cluster-wide metrics...")
-    root_con = get_pg_connection(user, password, host, port, admin_db)
+    print(f"\n[*] Connecting to source cluster '{cluster_title}' via '{s_admin_db}' on {s_host}:{s_port}...")
+    root_con = get_pg_connection(s_user, s_pwd, s_host, s_port, s_admin_db)
 
     audit_timestamp = datetime.datetime.now(datetime.timezone.utc)
     
@@ -516,11 +599,10 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
     print(f"[✓] Instance-level metrics gathered: Engine {engine_version}, {len(db_catalog_rows)} databases discovered.")
 
     # 3. Connect to target storage DB (e34data78) to record Audit Session
-    print(f"\n[*] Storing audit session metadata in '{storage_db}'...")
-    store_con = get_pg_connection(user, password, host, port, storage_db)
+    print(f"\n[*] Storing audit session metadata in '{t_db}' on {t_host}:{t_port}...")
+    store_con = get_pg_connection(storage_creds["user"], storage_creds["password"], t_host, t_port, t_db)
 
     try:
-        # A. Insert into db_instance_audits
         summary_payload = json.dumps({
             "total_databases": len(db_catalog_rows),
             "databases_list": [r[0] for r in db_catalog_rows],
@@ -528,6 +610,8 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
             "cache_hit_pct": cache_hit_pct,
             "current_connections": curr_conns,
             "max_connections": max_conns,
+            "environment": cluster_env,
+            "cluster_name": cluster_title,
         })
 
         insert_audit_q = """
@@ -538,7 +622,7 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
                 cache_hit_ratio_pct, current_connections, active_connections,
                 idle_connections, idle_in_transaction, max_connections,
                 connection_usage_pct, cpu_computing_queries, io_waiting_queries,
-                lock_waiting_queries, raw_json_summary
+                lock_waiting_queries, raw_json_summary, environment_profile, instance_name
             ) VALUES (
                 :ts, :host, :port, :eng_ver, :full_ver,
                 :started, :uptime, :total_dbs,
@@ -546,14 +630,14 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
                 :cache_hit, :c_conns, :act_conns,
                 :idle_conns, :idle_tx, :max_conns,
                 :conn_usage, :cpu_comp, :io_wait,
-                :lock_wait, :summary
+                :lock_wait, :summary, :env_prof, :inst_name
             ) RETURNING id;
         """
         audit_id = store_con.run(
             insert_audit_q,
             ts=audit_timestamp,
-            host=host,
-            port=port,
+            host=s_host,
+            port=s_port,
             eng_ver=engine_version,
             full_ver=full_version,
             started=postmaster_start,
@@ -571,10 +655,12 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
             cpu_comp=cpu_computing,
             io_wait=io_waiting,
             lock_wait=lock_waiting,
-            summary=summary_payload
+            summary=summary_payload,
+            env_prof=cluster_env,
+            inst_name=cluster_title
         )[0][0]
 
-        print(f"[✓] Created master audit session record: ID = {audit_id}")
+        print(f"[✓] Created master audit session record: ID = #{audit_id}")
 
         # B. Insert Roles/Users into db_cluster_users
         for u in roles_rows:
@@ -582,27 +668,26 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
                 INSERT INTO db_cluster_users (
                     audit_id, username, is_superuser, can_login, conn_limit, granted_roles, recorded_at
                 ) VALUES (
-                    :aid, :uname, :super, :login, :limit, :roles, :rec_at
+                    :aid, :uname, :super, :login, :lim, :roles, :rec_at
                 );
-            """, aid=audit_id, uname=u[0], super=u[1], login=u[2], limit=u[3], roles=u[4], rec_at=audit_timestamp)
+            """, aid=audit_id, uname=u[0], super=u[1], login=u[2], lim=u[3], roles=u[4], rec_at=audit_timestamp)
 
-        # C. Insert Cluster Settings
-        all_settings_groups = [mem_settings, worker_settings, net_settings, postmaster_settings]
-        for grp in all_settings_groups:
-            for s in grp:
-                store_con.run("""
-                    INSERT INTO db_cluster_settings (
-                        audit_id, category, setting_name, setting_value, unit, source, short_desc, recorded_at
-                    ) VALUES (
-                        :aid, :cat, :name, :val, :unit, :src, :desc, :rec_at
-                    );
-                """, aid=audit_id, cat=s[0], name=s[1], val=s[2], unit=s[3] or "", src=s[4] or "", desc=s[5] or "", rec_at=audit_timestamp)
+        # C. Insert Settings into db_cluster_settings
+        all_settings = mem_settings + worker_settings + net_settings + postmaster_settings
+        for s in all_settings:
+            store_con.run("""
+                INSERT INTO db_cluster_settings (
+                    audit_id, category, setting_name, setting_value, unit, source, short_desc, recorded_at
+                ) VALUES (
+                    :aid, :cat, :name, :val, :unit, :src, :desc, :rec_at
+                );
+            """, aid=audit_id, cat=s[0], name=s[1], val=s[2], unit=s[3], src=s[4], desc=s[5], rec_at=audit_timestamp)
 
-        print(f"[✓] Stored cluster users ({len(roles_rows)}) and system configurations in '{storage_db}'.")
+        print(f"[✓] Stored cluster users ({len(roles_rows)}) and system configurations in '{t_db}'.")
 
         # 4. Process Every Database on the Cluster
         print("\n" + "=" * 85)
-        print(" INSPECTING ALL DATABASES & INSERTING TABLES TO e34data78 ".center(85, "="))
+        print(f" INSPECTING ALL {len(db_catalog_rows)} DATABASES & INSERTING TABLES TO {t_db} ".center(85, "="))
         print("=" * 85)
 
         total_tables_inserted = 0
@@ -648,7 +733,7 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
             db_active_queries = []
 
             try:
-                db_con = get_pg_connection(user, password, host, port, db_name, timeout=8)
+                db_con = get_pg_connection(s_user, s_pwd, s_host, s_port, db_name, timeout=8)
                 try:
                     # User tables, views, indexes count
                     counts_row = db_con.run("""
@@ -703,10 +788,10 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
                     db_con.close()
 
             except Exception as e:
-                inspection_status = "ERROR"
+                inspection_status = "FAILED"
                 inspection_error = str(e)
 
-            # Insert database catalog entry
+            # Insert Catalog Entry into e34data78
             cat_id = store_con.run("""
                 INSERT INTO db_database_catalog (
                     audit_id, database_name, is_template, disk_size_pretty, disk_size_bytes,
@@ -722,27 +807,26 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
                  u_tbls=user_tables_count, u_views=user_views_count, u_idxs=user_indexes_count,
                  status=inspection_status, err=inspection_error, rec_at=audit_timestamp)[0][0]
 
-            # Insert all tables found in this database into db_database_tables
+            # Insert Tables into e34data78
             for t in db_tables_list:
                 store_con.run("""
                     INSERT INTO db_database_tables (
                         database_catalog_id, audit_id, database_name, schema_name, table_name,
                         full_table_name, total_size_pretty, total_size_bytes, table_size_pretty,
                         table_size_bytes, index_size_pretty, index_size_bytes, estimated_rows,
-                        seq_scan, idx_scan, n_dead_tup, last_vacuum, last_autovacuum, last_analyze,
-                        recorded_at
+                        seq_scan, idx_scan, n_dead_tup, last_vacuum, last_autovacuum, last_analyze, recorded_at
                     ) VALUES (
-                        :cid, :aid, :dbname, :sname, :tname, :ftname, :tot_p, :tot_b,
-                        :tbl_p, :tbl_b, :idx_p, :idx_b, :rows, :seq_s, :idx_s, :dead,
-                        :l_vac, :l_autovac, :l_anlz, :rec_at
+                        :cid, :aid, :dbname, :sname, :tname, :fname, :tot_p, :tot_b,
+                        :tbl_p, :tbl_b, :idx_p, :idx_b, :rows, :seq, :idx, :dead,
+                        :vac, :autovac, :anl, :rec_at
                     );
-                """, cid=cat_id, aid=audit_id, dbname=db_name, sname=t[0], tname=t[1], ftname=t[2],
+                """, cid=cat_id, aid=audit_id, dbname=db_name, sname=t[0], tname=t[1], fname=t[2],
                      tot_p=t[3], tot_b=t[4], tbl_p=t[5], tbl_b=t[6], idx_p=t[7], idx_b=t[8],
-                     rows=t[9], seq_s=t[10], idx_s=t[11], dead=t[12], l_vac=t[13], l_autovac=t[14],
-                     l_anlz=t[15], rec_at=audit_timestamp)
+                     rows=t[9], seq=t[10], idx=t[11], dead=t[12], vac=t[13], autovac=t[14], anl=t[15],
+                     rec_at=audit_timestamp)
                 total_tables_inserted += 1
 
-            # Insert any active in-flight queries for this database
+            # Insert Active In-flight Queries into e34data78
             for q in db_active_queries:
                 store_con.run("""
                     INSERT INTO db_database_active_queries (
@@ -758,7 +842,7 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
                 total_queries_inserted += 1
 
             status_icon = "✓" if inspection_status == "SUCCESS" else "!"
-            print(f"  [{status_icon}] {db_name:<30} | {size_pretty:<10} | Tables: {len(db_tables_list):<4} | Views: {user_views_count:<3} | Stored into {storage_db}")
+            print(f"  [{status_icon}] {db_name:<30} | {size_pretty:<10} | Tables: {len(db_tables_list):<4} | Views: {user_views_count:<3} | Stored into {t_db}")
 
         print("=" * 85)
 
@@ -777,8 +861,10 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
     result = {
         "status": "SUCCESS",
         "audit_id": audit_id,
-        "storage_database": storage_db,
-        "instance_host": f"{host}:{port}",
+        "storage_database": t_db,
+        "instance_host": f"{s_host}:{s_port}",
+        "environment": cluster_env,
+        "cluster_name": cluster_title,
         "engine_version": engine_version,
         "total_databases_recorded": verification_summary[0],
         "total_tables_stored": verification_summary[1],
@@ -789,15 +875,16 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
 
     # Save timestamped JSON artifact for reference
     ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_filename = f"db_audit_{storage_db}_{ts_str}.json"
+    json_filename = f"db_audit_{cluster_env}_{ts_str}.json"
     with open(json_filename, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\n[✓] ALL INFORMATION STORED SUCCESSFULLY INTO DATABASE: '{storage_db}'")
+    print(f"\n{BOLD}{GREEN}[✓] ALL INFORMATION STORED SUCCESSFULLY INTO DATABASE: '{t_db}'{RESET}")
     print(print_table([
-        ["Audit Session ID", audit_id],
-        ["Target Storage DB", storage_db],
-        ["PostgreSQL Host", f"{host}:{port}"],
+        ["Audit Session ID", f"#{audit_id}"],
+        ["Target Storage DB", t_db],
+        ["Cluster Host", f"{s_host}:{s_port}"],
+        ["Environment Profile", f"{cluster_env} ({cluster_title})"],
         ["Engine Version", engine_version],
         ["Total Databases Audited", verification_summary[0]],
         ["Total User Tables Stored", verification_summary[1]],
@@ -807,7 +894,34 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
         ["Local JSON Summary", os.path.abspath(json_filename)]
     ], headers=["Audit Metric", "Persisted Value"]))
 
+    # 6. Trigger backend live sync if backend is running
+    try:
+        req = urllib.request.Request("http://127.0.0.1:3001/api/instances/sync", data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                print(f"  {GREEN}✓ Backend cache synchronized at http://127.0.0.1:3001/api/instances{RESET}")
+    except Exception:
+        pass
+
     return result
+
+
+def audit_both_instances(storage_url: Optional[str] = None):
+    """Audits both UAT and Dev clusters sequentially and stores everything in e34data78."""
+    print(f"\n{BOLD}{CYAN}╔{'═' * 80}╗{RESET}")
+    print(f"{BOLD}{CYAN}║  DISCOVERING & INGESTING ALL DATABASES (UAT + DEV) INTO e34data78            ║{RESET}")
+    print(f"{BOLD}{CYAN}╚{'═' * 80}╝{RESET}\n")
+
+    res_uat = execute_discovery_and_store(target_name="uat", storage_url=storage_url)
+    print("\n" + "#" * 85 + "\n")
+    res_dev = execute_discovery_and_store(target_name="dev", storage_url=storage_url)
+
+    print(f"\n{BOLD}{CYAN}╔{'═' * 80}╗{RESET}")
+    print(f"{BOLD}{CYAN}║  BOTH DATABASE CLUSTERS SUCCESSFULLY AUDITED AND PERSISTED                  ║{RESET}")
+    print(f"{BOLD}{CYAN}╚{'═' * 80}╝{RESET}\n")
+    print(f"  • UAT Cluster (34.100.237.205): #{res_uat['audit_id']} ({res_uat['total_databases_recorded']} DBs, {res_uat['total_tables_stored']} tables)")
+    print(f"  • Dev Cluster (34.93.217.164):  #{res_dev['audit_id']} ({res_dev['total_databases_recorded']} DBs, {res_dev['total_tables_stored']} tables)")
+    print(f"  • Target Central Warehouse:      e34data78 on 34.100.237.205:5432\n")
 
 
 # ==============================================================================
@@ -816,7 +930,12 @@ def execute_discovery_and_store(custom_url: Optional[str] = None) -> Dict[str, A
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Database Discovery & Insertion Engine for e34data78")
-    parser.add_argument("--url", help="Database connection URL (supports standard and postgresql+asyncpg://)", default=None)
+    parser.add_argument("target", nargs="?", default=None, help="Target cluster: uat, dev, both, or all")
+    parser.add_argument("--uat", action="store_true", help="Audit UAT PostgreSQL instance (34.100.237.205)")
+    parser.add_argument("--dev", action="store_true", help="Audit Dev PostgreSQL instance (34.93.217.164)")
+    parser.add_argument("--both", "--all", action="store_true", help="Audit BOTH UAT and Dev database instances")
+    parser.add_argument("--url", help="Database connection URL to audit", default=None)
+    parser.add_argument("--storage-url", help="Central storage database URL (default: e34data78 on 34.100.237.205)", default=None)
     parser.add_argument("--target-db", help="Target storage database name (default: e34data78)", default="e34data78")
     parser.add_argument("--host", help="PostgreSQL host IP/hostname", default=None)
     parser.add_argument("--port", help="PostgreSQL port (default 5432)", type=int, default=None)
@@ -836,7 +955,16 @@ def main():
     if args.password:
         os.environ["DB_PWD"] = args.password
 
-    execute_discovery_and_store(custom_url=args.url)
+    # Check target
+    target = (args.target or "").lower()
+    if args.both or target in ("both", "all"):
+        audit_both_instances(storage_url=args.storage_url)
+    elif args.dev or target == "dev":
+        execute_discovery_and_store(target_name="dev", storage_url=args.storage_url)
+    elif args.uat or target == "uat":
+        execute_discovery_and_store(target_name="uat", storage_url=args.storage_url)
+    else:
+        execute_discovery_and_store(custom_url=args.url, storage_url=args.storage_url)
 
 
 if __name__ == "__main__":

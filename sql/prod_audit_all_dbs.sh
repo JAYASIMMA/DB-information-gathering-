@@ -10,7 +10,7 @@
 #   chmod +x sql/prod_audit_all_dbs.sh
 #   ./sql/prod_audit_all_dbs.sh
 #   # Or with explicit connection URL:
-#   ./sql/prod_audit_all_dbs.sh "postgresql://postgres:password@host:5432/dbname"
+#   ./sql/prod_audit_all_dbs.sh "postgresql://<user>:<password>@<host>:5432/<database>"
 # ==============================================================================
 
 set -eo pipefail

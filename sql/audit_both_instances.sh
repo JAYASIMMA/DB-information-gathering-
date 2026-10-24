@@ -491,7 +491,7 @@ EOF
 MP_HOST="${MARKET_DB_HOST:-bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com}"
 MP_PORT="${MARKET_DB_PORT:-5432}"
 MP_USER="${MARKET_DB_USER:-postgres}"
-MP_PWD="${MARKET_DB_PASSWORD:-9nj-Ahng5FCbdfjdsbcdggbj*7VGgbj}"
+MP_PWD="${MARKET_DB_PASSWORD:?MARKET_DB_PASSWORD must be set}"
 MP_NAME="${MARKET_DB_NAME:-bettrlabs_market_prod}"
 
 audit_instance "Marketplace RDS (bettrlabs-mp-prod)" "$MP_HOST" "$MP_PORT" "$MP_USER" "$MP_PWD" "$MP_NAME"
@@ -502,7 +502,7 @@ audit_instance "Marketplace RDS (bettrlabs-mp-prod)" "$MP_HOST" "$MP_PORT" "$MP_
 PR_HOST="${PRODUCT_DB_HOST:-bettrlabsprod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com}"
 PR_PORT="${PRODUCT_DB_PORT:-5432}"
 PR_USER="${PRODUCT_DB_USER:-bl_pg_admin}"
-PR_PWD="${PRODUCT_DB_PWD:-${PRODUCT_DB_PASSWORD:-7oRfnIND467GrxOIArQw}}"
+PR_PWD="${PRODUCT_DB_PWD:-${PRODUCT_DB_PASSWORD:?PRODUCT_DB_PASSWORD or PRODUCT_DB_PWD must be set}}"
 PR_NAME="${PRODUCT_DB_NAME:-ag4good_db}"
 
 audit_instance "Production Core DB (bettrlabsprod)" "$PR_HOST" "$PR_PORT" "$PR_USER" "$PR_PWD" "$PR_NAME"
