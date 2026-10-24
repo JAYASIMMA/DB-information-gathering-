@@ -518,7 +518,7 @@ def upsert_infra_instance_db(store_con, inst_id: str, kind: str, payload: Dict[s
         CREATE INDEX IF NOT EXISTS infra_instances_kind_idx ON infra_instances (kind);
     """)
 
-    payload_json = json.dumps(payload, ensure_ascii=False)
+    payload_json = json.dumps(payload, ensure_ascii=False, default=str)
 
     # 2. Check if instance already exists
     existing_rows = store_con.run(
@@ -575,6 +575,42 @@ def upsert_infra_instance_db(store_con, inst_id: str, kind: str, payload: Dict[s
             )
             print(f"{BOLD}{YELLOW}[~] infra_instances: Database instance '{inst_id}' values changed; updated payload.{RESET}")
             return "UPDATED"
+
+
+def cleanup_old_db_audits(store_con, days: int = 10, dry_run: bool = False) -> int:
+    """
+    Deletes audit sessions older than `days` days from db_instance_audits in e34data78.
+    Because of ON DELETE CASCADE on foreign keys, all related records in:
+      - db_cluster_users
+      - db_cluster_settings
+      - db_database_catalog
+      - db_database_tables
+      - db_database_active_queries
+    are automatically pruned.
+    Note: infra_instances is the current snapshot table and is NOT deleted.
+    """
+    if days <= 0:
+        return 0
+    try:
+        count_rows = store_con.run(
+            "SELECT COUNT(*) FROM db_instance_audits WHERE audit_timestamp < NOW() - (:days * INTERVAL '1 day') OR created_at < NOW() - (:days * INTERVAL '1 day');",
+            days=days
+        )
+        count = count_rows[0][0] if count_rows else 0
+        if count == 0:
+            return 0
+        if dry_run:
+            print(f"{YELLOW}[Retention] DRY-RUN: {count} database cluster audit session(s) older than {days} days would be deleted.{RESET}")
+            return count
+        store_con.run(
+            "DELETE FROM db_instance_audits WHERE audit_timestamp < NOW() - (:days * INTERVAL '1 day') OR created_at < NOW() - (:days * INTERVAL '1 day');",
+            days=days
+        )
+        print(f"{GREEN}[Retention] Successfully pruned {count} database cluster audit session(s) older than {days} days from e34data78.{RESET}")
+        return count
+    except Exception as e:
+        print(f"{YELLOW}[Retention] Warning: Automatic retention cleanup failed: {e}{RESET}")
+        return 0
 
 
 def ensure_target_db_and_schema(storage_creds: Dict[str, Any]):
@@ -1109,7 +1145,7 @@ def execute_discovery_and_store(
                 "rdsUser": s_user,
                 "rdsEngineVersion": engine_version,
                 "rdsUptime": uptime,
-                "rdsStartTime": postmaster_start,
+                "rdsStartTime": postmaster_start.strftime("%Y-%m-%d %H:%M:%S UTC") if isinstance(postmaster_start, (datetime.datetime, datetime.date)) else str(postmaster_start or ""),
                 "totalDatabases": len(db_catalog_rows),
                 "totalStorageUsed": total_storage_pretty,
                 "databases": databases_payload,
@@ -1166,6 +1202,13 @@ def execute_discovery_and_store(
             infra_action = upsert_infra_instance_db(store_con, inst_id, "rds", rds_payload)
         except Exception as e:
             print(f"{YELLOW}Warning: Failed to upsert infra_instances for {cluster_title}: {e}{RESET}")
+
+        # 7. Automated 10-day retention cleanup
+        try:
+            retention_days = int(os.getenv("AUDIT_RETENTION_DAYS", "10"))
+            cleanup_old_db_audits(store_con, days=retention_days)
+        except Exception as e:
+            print(f"{YELLOW}[Retention] Warning: DB audit retention cleanup failed: {e}{RESET}")
 
     finally:
         store_con.close()
@@ -1293,6 +1336,8 @@ def main():
     parser.add_argument("--url", help="Database connection URL to audit", default=None)
     parser.add_argument("--storage-url", help="Central storage database URL (default: e34data78 on 34.100.237.205)", default=None)
     parser.add_argument("--target-db", help="Target storage database name (default: e34data78)", default="e34data78")
+    parser.add_argument("--cleanup", type=int, nargs="?", const=10, default=None, help="Prune database cluster audits older than N days (default: 10)")
+    parser.add_argument("--dry-run-cleanup", action="store_true", help="Report records older than retention period without deleting")
     parser.add_argument("--host", help="PostgreSQL host IP/hostname", default=None)
     parser.add_argument("--port", help="PostgreSQL port (default 5432)", type=int, default=None)
     parser.add_argument("--user", help="PostgreSQL username", default=None)
@@ -1310,6 +1355,22 @@ def main():
         os.environ["DB_USER"] = args.user
     if args.password:
         os.environ["DB_PWD"] = args.password
+
+    # Standalone cleanup trigger
+    if args.cleanup is not None or args.dry_run_cleanup:
+        days = args.cleanup if args.cleanup is not None else int(os.getenv("AUDIT_RETENTION_DAYS", "10"))
+        storage_creds = parse_storage_credentials(custom_storage_url=args.storage_url)
+        store_con = get_pg_connection(
+            storage_creds["user"], storage_creds["password"],
+            storage_creds["host"], storage_creds["port"], storage_creds["storage_db"]
+        )
+        try:
+            pruned = cleanup_old_db_audits(store_con, days=days, dry_run=args.dry_run_cleanup)
+            action_desc = "would be pruned" if args.dry_run_cleanup else "pruned"
+            print(f"[i] Retention check completed: {pruned} database cluster audit sessions {action_desc} (threshold: {days} days).")
+        finally:
+            store_con.close()
+        return
 
     # Check target
     target = (args.target or "").strip().lower()
