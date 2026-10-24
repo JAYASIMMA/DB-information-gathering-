@@ -1,0 +1,12 @@
+{
+  "status": "SUCCESS",
+  "audit_id": 1,
+  "storage_database": "e34data78",
+  "instance_host": "34.100.237.205:5432",
+  "engine_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+  "total_databases_recorded": 13,
+  "total_tables_stored": 401,
+  "total_users_stored": 17,
+  "total_settings_stored": 83,
+  "total_cluster_storage": "1280 MB"
+}
