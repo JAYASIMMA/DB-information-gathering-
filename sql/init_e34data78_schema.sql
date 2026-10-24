@@ -175,3 +175,45 @@ SELECT
     t.recorded_at
 FROM db_database_tables t
 ORDER BY t.audit_id DESC, t.total_size_bytes DESC;
+
+-- 7. Aggregated Snapshot Table for Frontend API & Rust Backend
+CREATE TABLE IF NOT EXISTS infra_instances (
+    id           TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL CHECK (kind IN ('ec2', 'rds')),
+    payload      JSONB NOT NULL,
+    refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS infra_instances_kind_idx
+    ON infra_instances (kind);
+
+-- ==============================================================================
+-- 8. Automatic 10-Day Retention Policy Cleanup Procedure
+-- ==============================================================================
+CREATE OR REPLACE PROCEDURE prune_audit_logs_older_than(retention_days INT DEFAULT 10)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    ec2_deleted INT := 0;
+    db_deleted INT := 0;
+BEGIN
+    -- Delete EC2 infrastructure audits older than retention_days (cascades to all 7 child tables)
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'infrastructure_audit_logs') THEN
+        DELETE FROM infrastructure_audit_logs
+        WHERE timestamp < NOW() - make_interval(days => retention_days)
+           OR created_at < NOW() - make_interval(days => retention_days);
+        GET DIAGNOSTICS ec2_deleted = ROW_COUNT;
+        RAISE NOTICE 'Pruned % infrastructure audit session(s) older than % days', ec2_deleted, retention_days;
+    END IF;
+
+    -- Delete Database audits older than retention_days (cascades to all 5 child tables)
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'db_instance_audits') THEN
+        DELETE FROM db_instance_audits
+        WHERE audit_timestamp < NOW() - make_interval(days => retention_days)
+           OR created_at < NOW() - make_interval(days => retention_days);
+        GET DIAGNOSTICS db_deleted = ROW_COUNT;
+        RAISE NOTICE 'Pruned % database cluster audit session(s) older than % days', db_deleted, retention_days;
+    END IF;
+END;
+$$;
+

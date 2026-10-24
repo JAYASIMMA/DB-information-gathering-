@@ -469,7 +469,112 @@ SELECT
     t.recorded_at
 FROM db_database_tables t
 ORDER BY t.audit_id DESC, t.total_size_bytes DESC;
+
+-- 7. Aggregated Snapshot Table for Frontend API & Rust Backend
+CREATE TABLE IF NOT EXISTS infra_instances (
+    id           TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL CHECK (kind IN ('ec2', 'rds')),
+    payload      JSONB NOT NULL,
+    refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS infra_instances_kind_idx
+    ON infra_instances (kind);
 """
+
+
+def get_rds_instance_identity(host: str, env_profile: str, cluster_title: str) -> Tuple[str, str, str, str]:
+    """Returns (inst_id, display_name, short_name, env_name) matching backend contract."""
+    host_lower = (host or "").lower()
+    prof_lower = (env_profile or "").lower()
+    if host == "34.100.237.205" or "uat" in prof_lower:
+        return ("rds-uat", "PostgreSQL UAT Cluster (34.100.237.205)", "UAT RDS", "uat")
+    elif host == "34.93.217.164" or "dev" in prof_lower:
+        return ("rds-dev", "PostgreSQL Dev Cluster (34.93.217.164)", "Dev RDS", "development")
+    elif "bettrlabs-mp-prod" in host_lower or prof_lower in ("prod", "production", "marketplace"):
+        return ("rds-prod", "PostgreSQL Production Cluster (AWS RDS Marketplace)", "Prod RDS", "production")
+    elif "bettrlabsprod" in host_lower or "old" in prof_lower:
+        return ("rds-old-prod", "PostgreSQL Old Prod Cluster (AWS RDS Live Past)", "Old Prod RDS", "old_production")
+    else:
+        clean_host = host.replace(".", "-")
+        return (f"rds-{clean_host}", cluster_title or f"PostgreSQL Cluster ({host})", f"RDS {host}", prof_lower or "production")
+
+
+def upsert_infra_instance_db(store_con, inst_id: str, kind: str, payload: Dict[str, Any]) -> str:
+    """
+    Inserts or updates database instance details into `infra_instances` with primary key constraint:
+      - First time: Inserts the basic & full database instance details into `infra_instances`.
+      - Already inserted: Compares values with stored payload; if unchanged, skips update; if changed, updates payload.
+    Returns: 'INSERTED', 'UPDATED', or 'UNCHANGED'
+    """
+    # 1. Ensure table and constraint exist
+    store_con.run("""
+        CREATE TABLE IF NOT EXISTS infra_instances (
+            id           TEXT PRIMARY KEY,
+            kind         TEXT NOT NULL CHECK (kind IN ('ec2', 'rds')),
+            payload      JSONB NOT NULL,
+            refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS infra_instances_kind_idx ON infra_instances (kind);
+    """)
+
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    # 2. Check if instance already exists
+    existing_rows = store_con.run(
+        "SELECT payload, kind FROM infra_instances WHERE id = :id",
+        id=inst_id
+    )
+
+    if not existing_rows:
+        # First time for this instance: INSERT
+        store_con.run(
+            """
+            INSERT INTO infra_instances (id, kind, payload, refreshed_at)
+            VALUES (:id, :kind, :payload, now())
+            """,
+            id=inst_id,
+            kind=kind,
+            payload=payload_json
+        )
+        print(f"{BOLD}{GREEN}[✓] infra_instances: FIRST-TIME INSERT for database instance '{inst_id}' ({kind}){RESET}")
+        return "INSERTED"
+    else:
+        # Already inserted: compare values
+        existing_raw = existing_rows[0][0]
+        existing_kind = existing_rows[0][1]
+        if isinstance(existing_raw, str):
+            try:
+                existing_payload = json.loads(existing_raw)
+            except Exception:
+                existing_payload = {}
+        elif isinstance(existing_raw, dict):
+            existing_payload = existing_raw
+        else:
+            existing_payload = {}
+
+        # Compare payloads ignoring volatile timestamp
+        comp_existing = {k: v for k, v in existing_payload.items() if k not in ("timestamp",)}
+        comp_new = {k: v for k, v in payload.items() if k not in ("timestamp",)}
+
+        if comp_existing == comp_new and existing_kind == kind:
+            print(f"{GRAY}[=] infra_instances: Database instance '{inst_id}' already exists and values are unchanged; skipping update.{RESET}")
+            return "UNCHANGED"
+        else:
+            store_con.run(
+                """
+                UPDATE infra_instances
+                SET kind = :kind,
+                    payload = :payload,
+                    refreshed_at = now()
+                WHERE id = :id
+                """,
+                id=inst_id,
+                kind=kind,
+                payload=payload_json
+            )
+            print(f"{BOLD}{YELLOW}[~] infra_instances: Database instance '{inst_id}' values changed; updated payload.{RESET}")
+            return "UPDATED"
 
 
 def ensure_target_db_and_schema(storage_creds: Dict[str, Any]):
@@ -939,6 +1044,129 @@ def execute_discovery_and_store(
                 (SELECT count(*) FROM db_cluster_settings WHERE audit_id = :aid) AS total_settings;
         """, aid=audit_id)[0]
 
+        # 6. Insert / Update infra_instances table with constraint & compare-update
+        infra_action = "SKIPPED"
+        try:
+            cluster_top_tables = store_con.run("""
+                SELECT schema_name, database_name, table_name, total_size_pretty, table_size_pretty, index_size_pretty, estimated_rows, n_dead_tup
+                FROM db_database_tables
+                WHERE audit_id = :aid
+                ORDER BY total_size_bytes DESC LIMIT 15;
+            """, aid=audit_id)
+
+            db_top_tables = store_con.run("""
+                SELECT database_name, table_name, total_size_pretty, table_size_pretty, index_size_pretty, estimated_rows, n_dead_tup
+                FROM db_database_tables
+                WHERE audit_id = :aid
+                ORDER BY total_size_bytes DESC;
+            """, aid=audit_id)
+
+            databases_payload = []
+            for db_row in db_catalog_rows:
+                d_name = db_row[0]
+                d_size = db_row[2]
+                d_enc = db_row[4] or "UTF8"
+                d_coll = db_row[5] or "en_US.UTF-8"
+                top_t = [
+                    {
+                        "name": t[1],
+                        "totalSize": t[2],
+                        "dataSize": t[3],
+                        "indexSize": t[4],
+                        "liveRows": int(t[5] or 0),
+                        "deadRows": int(t[6] or 0),
+                    }
+                    for t in db_top_tables if t[0] == d_name
+                ][:5]
+                c_info = conns_by_db.get(d_name, {"total": 0})
+                databases_payload.append({
+                    "name": d_name,
+                    "owner": "postgres",
+                    "size": d_size,
+                    "encoding": d_enc,
+                    "collation": d_coll,
+                    "connectionLimit": -1,
+                    "currentConnections": c_info.get("total", 0),
+                    "tablesCount": len(top_t),
+                    "schemasCount": 1,
+                    "topTables": top_t,
+                })
+
+            inst_id, display_name, short_name, env_name = get_rds_instance_identity(s_host, cluster_env, cluster_title)
+
+            rds_payload = {
+                "id": inst_id,
+                "kind": "rds",
+                "name": display_name,
+                "shortName": short_name,
+                "environment": env_name,
+                "region": "ap-south-1 / ap-south-1a",
+                "status": "warning" if (conn_usage_pct and float(conn_usage_pct) > 80.0) else "healthy",
+                "instanceType": "db.r6g.xlarge",
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "rdsEndpoint": f"{s_host}:{s_port}",
+                "rdsDefaultDb": s_admin_db or "postgres",
+                "rdsUser": s_user,
+                "rdsEngineVersion": engine_version,
+                "rdsUptime": uptime,
+                "rdsStartTime": postmaster_start,
+                "totalDatabases": len(db_catalog_rows),
+                "totalStorageUsed": total_storage_pretty,
+                "databases": databases_payload,
+                "connectionSummary": {
+                    "currentConnections": curr_conns,
+                    "clusterMax": max_conns,
+                    "superuserReserved": 3,
+                    "usablePool": max(0, max_conns - 3),
+                    "usagePct": float(conn_usage_pct) if conn_usage_pct is not None else 0.0,
+                },
+                "memorySettings": [
+                    {"parameter": r[1], "value": r[2], "description": r[5] or ""}
+                    for r in mem_settings
+                ],
+                "cacheHitRatio": cache_hit_pct,
+                "cpuState": {
+                    "totalBackends": curr_conns,
+                    "cpuComputing": cpu_computing,
+                    "idleSessions": idle_conns,
+                    "idleInTx": idle_tx,
+                    "ioWaiting": io_waiting,
+                    "lockWaiting": lock_waiting,
+                },
+                "dbUsers": [
+                    {
+                        "username": u[0],
+                        "isSuperuser": bool(u[1]),
+                        "inherits": True,
+                        "canCreateRoles": False,
+                        "canCreateDb": False,
+                        "canLogin": bool(u[2]),
+                        "memberOf": u[4] or "",
+                    }
+                    for u in roles_rows
+                ],
+                "topTables": [
+                    {
+                        "schema": t[0],
+                        "name": f"{t[1]}.{t[2]}",
+                        "totalSize": t[3],
+                        "dataSize": t[4],
+                        "indexSize": t[5],
+                        "liveRows": int(t[6] or 0),
+                        "deadRows": int(t[7] or 0),
+                    }
+                    for t in cluster_top_tables
+                ],
+                "networkSettings": [
+                    {"name": r[1], "value": r[2], "description": r[5] or ""}
+                    for r in net_settings
+                ],
+            }
+
+            infra_action = upsert_infra_instance_db(store_con, inst_id, "rds", rds_payload)
+        except Exception as e:
+            print(f"{YELLOW}Warning: Failed to upsert infra_instances for {cluster_title}: {e}{RESET}")
+
     finally:
         store_con.close()
 
@@ -955,6 +1183,7 @@ def execute_discovery_and_store(
         "total_users_stored": verification_summary[2],
         "total_settings_stored": verification_summary[3],
         "total_cluster_storage": total_storage_pretty,
+        "infra_instances_action": infra_action,
     }
 
     # Save timestamped JSON artifact for reference
@@ -975,6 +1204,7 @@ def execute_discovery_and_store(
         ["Cluster Roles Stored", verification_summary[2]],
         ["Cluster Settings Stored", verification_summary[3]],
         ["Total Storage Across All DBs", total_storage_pretty],
+        ["infra_instances Table Action", infra_action],
         ["Local JSON Summary", os.path.abspath(json_filename)]
     ], headers=["Audit Metric", "Persisted Value"]))
 
