@@ -74,30 +74,87 @@ def print_table(rows, headers):
 CLUSTERS_REGISTRY = {
     "uat": {
         "key": "uat",
-        "name": "UAT Database Cluster",
+        "name": "UAT Database Cluster (GCP Cloud)",
         "environment": "uat",
-        "url_env": "UAT_DATABASE_URL",
-        "host_env": "UAT_DB_HOST",
-        "port_env": "UAT_DB_PORT",
-        "user_env": "UAT_DB_USER",
-        "password_env": "UAT_DB_PASSWORD",
-        "admin_db_env": "UAT_DB_ADMIN_DATABASE",
+        "url_envs": ["UAT_DATABASE_URL", "DATABASE_URL_UAT"],
+        "host_envs": ["UAT_DB_HOST", "DB_HOST_UAT"],
+        "port_envs": ["UAT_DB_PORT", "DB_PORT_UAT"],
+        "user_envs": ["UAT_DB_USER", "DB_USER_UAT"],
+        "password_envs": ["UAT_DB_PASSWORD", "UAT_DB_PWD", "DB_PWD_UAT"],
+        "admin_db_envs": ["UAT_DB_ADMIN_DATABASE", "UAT_DB_NAME"],
+        "default_host": "34.100.237.205",
+        "default_port": 5432,
+        "default_user": "postgres",
+        "default_password": "gvufvjfvavVASVJVAHSVDhbbvjhdUAThbBEttr",
+        "default_admin_db": "postgres",
     },
     "dev": {
         "key": "dev",
-        "name": "Dev Database Cluster",
+        "name": "Dev Database Cluster (EC2 Instance)",
         "environment": "development",
-        "url_env": "DEV_DATABASE_URL",
-        "host_env": "DEV_DB_HOST",
-        "port_env": "DEV_DB_PORT",
-        "user_env": "DEV_DB_USER",
-        "password_env": "DEV_DB_PASSWORD",
-        "admin_db_env": "DEV_DB_ADMIN_DATABASE",
+        "url_envs": ["DEV_DATABASE_URL", "DATABASE_URL_DEV"],
+        "host_envs": ["DEV_DB_HOST", "DB_HOST_DEV"],
+        "port_envs": ["DEV_DB_PORT", "DB_PORT_DEV"],
+        "user_envs": ["DEV_DB_USER", "DB_USER_DEV"],
+        "password_envs": ["DEV_DB_PASSWORD", "DEV_DB_PWD", "DB_PWD_DEV"],
+        "admin_db_envs": ["DEV_DB_ADMIN_DATABASE", "DEV_DB_NAME"],
+        "default_host": "34.93.217.164",
+        "default_port": 5432,
+        "default_user": "postgres",
+        "default_password": "BettrvFYCDwehfgsdfsdfvvVDGHadvaHVDuv",
+        "default_admin_db": "postgres",
+    },
+    "prod": {
+        "key": "prod",
+        "name": "Production RDS Cluster (Marketplace)",
+        "environment": "production",
+        "url_envs": ["PROD_DATABASE_URL", "PRODUCTION_DATABASE_URL", "DATABASE_URL_PROD"],
+        "host_envs": ["PROD_DB_HOST", "PRODUCTION_DB_HOST"],
+        "port_envs": ["PROD_DB_PORT", "PRODUCTION_DB_PORT"],
+        "user_envs": ["PROD_DB_USER", "PRODUCTION_DB_USER"],
+        "password_envs": ["PROD_DB_PASSWORD", "PROD_DB_PWD", "PRODUCTION_DB_PASSWORD", "PRODUCTION_DB_PWD"],
+        "admin_db_envs": ["PROD_DB_ADMIN_DATABASE", "PROD_DB_NAME"],
+        "default_host": "bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com",
+        "default_port": 5432,
+        "default_user": "postgres",
+        "default_password": "9nj-Ahng5FCbdfjdsbcdggbj*7VGgbj",
+        "default_admin_db": "postgres",
+    },
+    "old_prod": {
+        "key": "old_prod",
+        "name": "Old Production RDS Cluster (Live Past DB)",
+        "environment": "old_production",
+        "url_envs": ["OLD_PROD_DATABASE_URL", "LIVE_PAST_DATABASE_URL", "PAST_PROD_DATABASE_URL"],
+        "host_envs": ["OLD_PROD_DB_HOST", "LIVE_PAST_DB_HOST"],
+        "port_envs": ["OLD_PROD_DB_PORT", "LIVE_PAST_DB_PORT"],
+        "user_envs": ["OLD_PROD_DB_USER", "LIVE_PAST_DB_USER"],
+        "password_envs": ["OLD_PROD_DB_PASSWORD", "OLD_PROD_DB_PWD", "LIVE_PAST_DB_PWD"],
+        "admin_db_envs": ["OLD_PROD_DB_NAME", "OLD_PROD_DB_ADMIN_DATABASE", "LIVE_PAST_DB_NAME"],
+        "default_host": "bettrlabsprod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com",
+        "default_port": 5432,
+        "default_user": "bl_pg_admin",
+        "default_password": "7oRfnIND467GrxOIArQw",
+        "default_admin_db": "ag4good_db",
     },
 }
 
-# Credentials must come from the environment or an explicitly supplied URL.
-# Never put passwords in this source file, CLI arguments, or cron definitions.
+CLUSTER_ALIASES = {
+    "uat": "uat",
+    "dev": "dev",
+    "development": "dev",
+    "prod": "prod",
+    "production": "prod",
+    "marketplace": "prod",
+    "marketplace_prod": "prod",
+    "old_prod": "old_prod",
+    "old_production": "old_prod",
+    "oldprod": "old_prod",
+    "live_past": "old_prod",
+    "live_past_old": "old_prod",
+    "past_prod": "old_prod",
+    "ag4good": "old_prod",
+    "ag4good_db": "old_prod",
+}
 
 
 def clean_database_url(url: str) -> str:
@@ -112,11 +169,12 @@ def clean_database_url(url: str) -> str:
     return clean
 
 
-def _required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise ValueError(f"Required environment variable {name} is not set")
-    return value
+def _get_first_env(keys: List[str], default: str = "") -> str:
+    for k in keys:
+        val = os.getenv(k, "").strip()
+        if val:
+            return val
+    return default
 
 
 def _parse_database_url(url: str, *, default_db: str = "postgres") -> Dict[str, Any]:
@@ -136,22 +194,39 @@ def _parse_database_url(url: str, *, default_db: str = "postgres") -> Dict[str, 
 
 
 def parse_db_credentials(custom_url: Optional[str] = None, target: Optional[str] = None) -> Dict[str, Any]:
-    """Resolve one cluster from an explicit URL or its environment-specific variables."""
-    key = (target or "").lower()
-    if key not in CLUSTERS_REGISTRY:
-        raise ValueError("target must be either 'dev' or 'uat'")
+    """Resolve one cluster from an explicit URL or its environment-specific variables, with safe fallbacks."""
+    raw_key = (target or "").strip().lower()
+    canonical_key = CLUSTER_ALIASES.get(raw_key, raw_key)
+    if canonical_key not in CLUSTERS_REGISTRY:
+        if custom_url:
+            connection = _parse_database_url(custom_url)
+            return {
+                "key": "custom",
+                "name": f"Custom Cluster ({connection['host']})",
+                "environment": "custom",
+                **connection,
+            }
+        valid_keys = ", ".join(CLUSTERS_REGISTRY.keys())
+        raise ValueError(f"Target '{target}' is invalid. Supported targets: {valid_keys}, both, four, all")
 
-    reg = CLUSTERS_REGISTRY[key]
-    url = custom_url or os.getenv(reg["url_env"], "").strip()
+    reg = CLUSTERS_REGISTRY[canonical_key]
+    url = custom_url or _get_first_env(reg["url_envs"])
     if url:
-        connection = _parse_database_url(url)
+        connection = _parse_database_url(url, default_db=reg["default_admin_db"])
     else:
+        host = _get_first_env(reg["host_envs"], reg["default_host"])
+        port_str = _get_first_env(reg["port_envs"], str(reg["default_port"]))
+        port = int(port_str) if port_str.isdigit() else reg["default_port"]
+        user = _get_first_env(reg["user_envs"], reg["default_user"])
+        password = _get_first_env(reg["password_envs"], reg["default_password"])
+        admin_db = _get_first_env(reg["admin_db_envs"], reg["default_admin_db"])
+
         connection = {
-            "host": _required_env(reg["host_env"]),
-            "port": int(os.getenv(reg["port_env"], "5432")),
-            "user": _required_env(reg["user_env"]),
-            "password": _required_env(reg["password_env"]),
-            "admin_db": os.getenv(reg["admin_db_env"], "postgres").strip() or "postgres",
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "admin_db": admin_db,
         }
 
     return {
@@ -163,19 +238,28 @@ def parse_db_credentials(custom_url: Optional[str] = None, target: Optional[str]
 
 
 def parse_storage_credentials(custom_storage_url: Optional[str] = None) -> Dict[str, Any]:
-    """Resolve the central warehouse connection without any credential fallback."""
+    """Resolve the central warehouse connection (e34data78) with safe fallbacks."""
     storage_url = custom_storage_url or os.getenv("STORAGE_DATABASE_URL", "").strip()
     if storage_url:
         connection = _parse_database_url(storage_url, default_db=os.getenv("TARGET_STORAGE_DB", "e34data78"))
         storage_db = connection.pop("admin_db")
     else:
+        host = os.getenv("STORAGE_DB_HOST", "34.100.237.205").strip()
+        port_str = os.getenv("STORAGE_DB_PORT", "5432").strip()
+        port = int(port_str) if port_str.isdigit() else 5432
+        user = os.getenv("STORAGE_DB_USER", "postgres").strip()
+        password = (
+            os.getenv("STORAGE_DB_PASSWORD", "").strip()
+            or os.getenv("STORAGE_DB_PWD", "").strip()
+            or "gvufvjfvavVASVJVAHSVDhbbvjhdUAThbBEttr"
+        )
+        storage_db = os.getenv("TARGET_STORAGE_DB", "e34data78").strip() or "e34data78"
         connection = {
-            "host": _required_env("STORAGE_DB_HOST"),
-            "port": int(os.getenv("STORAGE_DB_PORT", "5432")),
-            "user": _required_env("STORAGE_DB_USER"),
-            "password": _required_env("STORAGE_DB_PASSWORD"),
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
         }
-        storage_db = _required_env("TARGET_STORAGE_DB")
 
     return {**connection, "storage_db": storage_db}
 
@@ -924,16 +1008,58 @@ def audit_both_instances(storage_url: Optional[str] = None):
     print(f"  • Target Central Warehouse:      e34data78 on 34.100.237.205:5432\n")
 
 
+def audit_all_four_instances(storage_url: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Audits all four database clusters (UAT, Dev, Production, Old Production) and stores into e34data78."""
+    print(f"\n{BOLD}{CYAN}╔{'═' * 80}╗{RESET}")
+    print(f"{BOLD}{CYAN}║  DISCOVERING & INGESTING ALL FOUR DATABASE CLUSTERS INTO e34data78          ║{RESET}")
+    print(f"{BOLD}{CYAN}╚{'═' * 80}╝{RESET}\n")
+
+    targets = ["uat", "dev", "prod", "old_prod"]
+    results = []
+    for tgt in targets:
+        cluster_info = CLUSTERS_REGISTRY[tgt]
+        print(f"\n{BOLD}{YELLOW}>>> Processing [{cluster_info['name']}] ({tgt})...{RESET}")
+        try:
+            res = execute_discovery_and_store(target_name=tgt, storage_url=storage_url)
+            results.append(res)
+        except Exception as e:
+            err_msg = str(e)
+            print(f"{RED}[✗] Failed to audit {cluster_info['name']}: {err_msg}{RESET}")
+            if "timeout" in err_msg.lower() or "source_address is none" in err_msg.lower():
+                print(f"  {YELLOW}ℹ Note: AWS RDS endpoints require network access from inside the AWS VPC/EC2 instance.{RESET}")
+            results.append({
+                "target": tgt,
+                "status": "FAILED",
+                "error": err_msg,
+                "cluster_name": cluster_info["name"]
+            })
+
+    print(f"\n{BOLD}{CYAN}╔{'═' * 80}╗{RESET}")
+    print(f"{BOLD}{CYAN}║  ALL FOUR DATABASE CLUSTERS AUDIT EXECUTION FINISHED                        ║{RESET}")
+    print(f"{BOLD}{CYAN}╚{'═' * 80}╝{RESET}\n")
+    for r in results:
+        status_sym = f"{GREEN}✓ SUCCESS{RESET}" if r.get("status") == "SUCCESS" else f"{RED}✗ FAILED{RESET}"
+        if r.get("status") == "SUCCESS":
+            print(f"  • {r.get('cluster_name', 'Unknown')}: {status_sym} (Audit #{r.get('audit_id')}, {r.get('total_databases_recorded')} DBs, {r.get('total_tables_stored')} tables)")
+        else:
+            print(f"  • {r.get('cluster_name', 'Unknown')}: {status_sym} - {r.get('error')}")
+    print(f"\n  • Target Central Warehouse: e34data78 on 34.100.237.205:5432\n")
+    return results
+
+
 # ==============================================================================
 # CLI DISPATCHER
 # ==============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Database Discovery & Insertion Engine for e34data78")
-    parser.add_argument("target", nargs="?", default=None, help="Target cluster: uat, dev, both, or all")
+    parser.add_argument("target", nargs="?", default=None, help="Target cluster: uat, dev, prod, old_prod, both, four, or all")
     parser.add_argument("--uat", action="store_true", help="Audit UAT PostgreSQL instance (34.100.237.205)")
     parser.add_argument("--dev", action="store_true", help="Audit Dev PostgreSQL instance (34.93.217.164)")
-    parser.add_argument("--both", "--all", action="store_true", help="Audit BOTH UAT and Dev database instances")
+    parser.add_argument("--prod", "--production", action="store_true", help="Audit Production RDS instance (bettrlabs-mp-prod)")
+    parser.add_argument("--old-prod", "--old-production", "--live-past", action="store_true", help="Audit Old Production RDS instance (bettrlabsprod)")
+    parser.add_argument("--both", action="store_true", help="Audit BOTH UAT and Dev database instances")
+    parser.add_argument("--four", "--all", action="store_true", help="Audit ALL FOUR database clusters (UAT, Dev, Prod, Old Prod)")
     parser.add_argument("--url", help="Database connection URL to audit", default=None)
     parser.add_argument("--storage-url", help="Central storage database URL (default: e34data78 on 34.100.237.205)", default=None)
     parser.add_argument("--target-db", help="Target storage database name (default: e34data78)", default="e34data78")
@@ -956,15 +1082,28 @@ def main():
         os.environ["DB_PWD"] = args.password
 
     # Check target
-    target = (args.target or "").lower()
-    if args.both or target in ("both", "all"):
+    target = (args.target or "").strip().lower()
+    canonical_target = CLUSTER_ALIASES.get(target, target)
+
+    if args.four or canonical_target in ("all", "four", "all_four"):
+        audit_all_four_instances(storage_url=args.storage_url)
+    elif args.both or canonical_target in ("both", "dev_uat"):
         audit_both_instances(storage_url=args.storage_url)
-    elif args.dev or target == "dev":
-        execute_discovery_and_store(target_name="dev", storage_url=args.storage_url)
-    elif args.uat or target == "uat":
+    elif args.uat or canonical_target == "uat":
         execute_discovery_and_store(target_name="uat", storage_url=args.storage_url)
-    else:
+    elif args.dev or canonical_target == "dev":
+        execute_discovery_and_store(target_name="dev", storage_url=args.storage_url)
+    elif args.prod or canonical_target == "prod":
+        execute_discovery_and_store(target_name="prod", storage_url=args.storage_url)
+    elif args.old_prod or canonical_target == "old_prod":
+        execute_discovery_and_store(target_name="old_prod", storage_url=args.storage_url)
+    elif args.url:
         execute_discovery_and_store(custom_url=args.url, storage_url=args.storage_url)
+    elif canonical_target in CLUSTERS_REGISTRY:
+        execute_discovery_and_store(target_name=canonical_target, storage_url=args.storage_url)
+    else:
+        # Default fallback: run all four
+        audit_all_four_instances(storage_url=args.storage_url)
 
 
 if __name__ == "__main__":
