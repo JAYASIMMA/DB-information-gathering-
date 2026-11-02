@@ -85,7 +85,7 @@ CLUSTERS_REGISTRY = {
         "default_host": "34.100.237.205",
         "default_port": 5432,
         "default_user": "postgres",
-        "default_password": "gvufvjfvavVASVJVAHSVDhbbvjhdUAThbBEttr",
+        "default_password": "",
         "default_admin_db": "postgres",
     },
     "dev": {
@@ -101,7 +101,7 @@ CLUSTERS_REGISTRY = {
         "default_host": "34.93.217.164",
         "default_port": 5432,
         "default_user": "postgres",
-        "default_password": "BettrvFYCDwehfgsdfsdfvvVDGHadvaHVDuv",
+        "default_password": "",
         "default_admin_db": "postgres",
     },
     "prod": {
@@ -117,7 +117,7 @@ CLUSTERS_REGISTRY = {
         "default_host": "bettrlabs-mp-prod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com",
         "default_port": 5432,
         "default_user": "postgres",
-        "default_password": "9nj-Ahng5FCbdfjdsbcdggbj*7VGgbj",
+        "default_password": "",
         "default_admin_db": "postgres",
     },
     "old_prod": {
@@ -133,7 +133,7 @@ CLUSTERS_REGISTRY = {
         "default_host": "bettrlabsprod.cbke0k4kiq34.ap-south-1.rds.amazonaws.com",
         "default_port": 5432,
         "default_user": "bl_pg_admin",
-        "default_password": "7oRfnIND467GrxOIArQw",
+        "default_password": "",
         "default_admin_db": "ag4good_db",
     },
 }
@@ -251,7 +251,6 @@ def parse_storage_credentials(custom_storage_url: Optional[str] = None) -> Dict[
         password = (
             os.getenv("STORAGE_DB_PASSWORD", "").strip()
             or os.getenv("STORAGE_DB_PWD", "").strip()
-            or "gvufvjfvavVASVJVAHSVDhbbvjhdUAThbBEttr"
         )
         storage_db = os.getenv("TARGET_STORAGE_DB", "e34data78").strip() or "e34data78"
         connection = {
@@ -498,6 +497,179 @@ def get_rds_instance_identity(host: str, env_profile: str, cluster_title: str) -
     else:
         clean_host = host.replace(".", "-")
         return (f"rds-{clean_host}", cluster_title or f"PostgreSQL Cluster ({host})", f"RDS {host}", prof_lower or "production")
+
+
+# Hosting facts the audit tables do not capture. Keep in sync with `rds_hosting`
+# in backend/src/sync.rs so every writer of infra_instances produces the same payload.
+RDS_HOSTING: Dict[str, Dict[str, str]] = {
+    "rds-uat": {"region": "GCP (34.100.237.205)", "instanceType": "Self-managed PostgreSQL (GCP VM)", "user": "postgres", "defaultDb": "postgres"},
+    "rds-dev": {"region": "Self-hosted (34.93.217.164)", "instanceType": "Self-managed PostgreSQL (EC2)", "user": "postgres", "defaultDb": "postgres"},
+    "rds-prod": {"region": "ap-south-1", "instanceType": "AWS RDS PostgreSQL", "user": "postgres", "defaultDb": "postgres"},
+    "rds-old-prod": {"region": "ap-south-1", "instanceType": "AWS RDS PostgreSQL", "user": "bl_pg_admin", "defaultDb": "ag4good_db"},
+}
+
+
+def get_rds_hosting(inst_id: str, host: str) -> Dict[str, str]:
+    """Region, instance type and admin login for a cluster, falling back to the RDS hostname."""
+    if inst_id in RDS_HOSTING:
+        return RDS_HOSTING[inst_id]
+    host_lower = (host or "").lower()
+    suffix = ".rds.amazonaws.com"
+    region = host_lower[: -len(suffix)].rsplit(".", 1)[-1] if host_lower.endswith(suffix) else "unknown"
+    return {"region": region, "instanceType": "PostgreSQL", "user": "postgres", "defaultDb": "postgres"}
+
+
+def build_rds_payload(store_con, audit_id: int) -> Tuple[str, Dict[str, Any]]:
+    """Builds the infra_instances RDS payload for one stored audit, reading only e34data78 tables."""
+    (audit_ts, db_host, db_port, eng_ver, tot_dbs, tot_storage, cur_conns, max_conns, conn_usage,
+     cpu_comp, idle_conns, idle_tx, io_wait, lock_wait, cache_hit, uptime_val, started_at,
+     env_prof, inst_title) = store_con.run("""
+        SELECT audit_timestamp::text, host, port, engine_version, total_databases_count,
+               total_cluster_storage_pretty, current_connections, max_connections,
+               connection_usage_pct::float8, cpu_computing_queries, idle_connections,
+               idle_in_transaction, io_waiting_queries, lock_waiting_queries,
+               cache_hit_ratio_pct::float8, uptime::text, postmaster_started_at::text,
+               environment_profile, instance_name
+        FROM db_instance_audits
+        WHERE id = :aid;
+    """, aid=audit_id)[0]
+
+    catalog_rows = store_con.run("""
+        SELECT database_name, disk_size_pretty, encoding, db_collation, total_connections, user_tables_count
+        FROM db_database_catalog
+        WHERE audit_id = :aid
+        ORDER BY disk_size_bytes DESC;
+    """, aid=audit_id)
+
+    # Top 5 tables of every database (not only those that make the cluster-wide top 15)
+    per_db_top_rows = store_con.run("""
+        SELECT database_name, table_name, total_size_pretty, table_size_pretty, index_size_pretty, estimated_rows, n_dead_tup
+        FROM (
+            SELECT *, row_number() OVER (PARTITION BY database_name ORDER BY total_size_bytes DESC) AS rn
+            FROM db_database_tables
+            WHERE audit_id = :aid
+        ) ranked
+        WHERE rn <= 5
+        ORDER BY database_name, rn;
+    """, aid=audit_id)
+
+    cluster_top_rows = store_con.run("""
+        SELECT schema_name, database_name, table_name, total_size_pretty, table_size_pretty, index_size_pretty, estimated_rows, n_dead_tup
+        FROM db_database_tables
+        WHERE audit_id = :aid
+        ORDER BY total_size_bytes DESC LIMIT 15;
+    """, aid=audit_id)
+
+    user_rows = store_con.run("""
+        SELECT username, is_superuser, can_login, conn_limit, granted_roles
+        FROM db_cluster_users
+        WHERE audit_id = :aid
+        ORDER BY is_superuser DESC, username ASC;
+    """, aid=audit_id)
+
+    settings_rows = store_con.run("""
+        SELECT category, setting_name, setting_value, unit, short_desc
+        FROM db_cluster_settings
+        WHERE audit_id = :aid AND category IN ('memory', 'network');
+    """, aid=audit_id)
+
+    def top_table(t) -> Dict[str, Any]:
+        return {
+            "name": t[1],
+            "totalSize": t[2],
+            "dataSize": t[3],
+            "indexSize": t[4],
+            "liveRows": int(t[5] or 0),
+            "deadRows": int(t[6] or 0),
+        }
+
+    databases = [
+        {
+            "name": d[0],
+            "owner": "postgres",
+            "size": d[1],
+            "encoding": d[2] or "UTF8",
+            "collation": d[3] or "en_US.UTF-8",
+            "connectionLimit": -1,
+            "currentConnections": int(d[4] or 0),
+            "tablesCount": int(d[5] or 0),
+            "schemasCount": 1,
+            "topTables": [top_table(t) for t in per_db_top_rows if t[0] == d[0]],
+        }
+        for d in catalog_rows
+    ]
+
+    inst_id, display_name, short_name, env_name = get_rds_instance_identity(db_host, env_prof or "", inst_title or "")
+    hosting = get_rds_hosting(inst_id, db_host)
+    max_conns = int(max_conns or 100)
+    conn_usage = float(conn_usage or 0.0)
+
+    payload = {
+        "id": inst_id,
+        "kind": "rds",
+        "name": display_name,
+        "shortName": short_name,
+        "environment": env_name,
+        "region": hosting["region"],
+        "status": "warning" if conn_usage > 80.0 else "healthy",
+        "instanceType": hosting["instanceType"],
+        "timestamp": audit_ts,
+        "rdsEndpoint": f"{db_host}:{db_port}",
+        "rdsDefaultDb": hosting["defaultDb"],
+        "rdsUser": hosting["user"],
+        "rdsEngineVersion": eng_ver or "PostgreSQL",
+        "rdsUptime": uptime_val or "N/A",
+        "rdsStartTime": started_at or "N/A",
+        "totalDatabases": int(tot_dbs or len(databases)),
+        "totalStorageUsed": tot_storage or "0 MB",
+        "databases": databases,
+        "connectionSummary": {
+            "currentConnections": int(cur_conns or 0),
+            "clusterMax": max_conns,
+            "superuserReserved": 3,
+            "usablePool": max(0, max_conns - 3),
+            "usagePct": conn_usage,
+        },
+        "memorySettings": [
+            {
+                "parameter": s[1],
+                "value": f"{s[2]} {s[3]}" if s[3] and s[3].strip() else s[2],
+                "description": s[4] or "",
+            }
+            for s in settings_rows if s[0] == "memory"
+        ],
+        "cacheHitRatio": float(cache_hit) if cache_hit is not None else None,
+        "cpuState": {
+            "totalBackends": int(cur_conns or 0),
+            "cpuComputing": int(cpu_comp or 0),
+            "idleSessions": int(idle_conns or 0),
+            "idleInTx": int(idle_tx or 0),
+            "ioWaiting": int(io_wait or 0),
+            "lockWaiting": int(lock_wait or 0),
+        },
+        # db_cluster_users stores only rolsuper/rolcanlogin, so create-db/create-role follow superuser
+        "dbUsers": [
+            {
+                "username": u[0],
+                "isSuperuser": bool(u[1]),
+                "inherits": True,
+                "canCreateRoles": bool(u[1]),
+                "canCreateDb": bool(u[1]),
+                "canLogin": bool(u[2]),
+                "memberOf": u[4] or "",
+            }
+            for u in user_rows
+        ],
+        "topTables": [
+            {"schema": t[0], **top_table(t[1:]), "name": f"{t[1]}.{t[2]}"}
+            for t in cluster_top_rows
+        ],
+        "networkSettings": [
+            {"name": s[1], "value": s[2], "description": s[4] or ""}
+            for s in settings_rows if s[0] == "network"
+        ],
+    }
+    return inst_id, payload
 
 
 def upsert_infra_instance_db(store_con, inst_id: str, kind: str, payload: Dict[str, Any]) -> str:
@@ -1083,122 +1255,7 @@ def execute_discovery_and_store(
         # 6. Insert / Update infra_instances table with constraint & compare-update
         infra_action = "SKIPPED"
         try:
-            cluster_top_tables = store_con.run("""
-                SELECT schema_name, database_name, table_name, total_size_pretty, table_size_pretty, index_size_pretty, estimated_rows, n_dead_tup
-                FROM db_database_tables
-                WHERE audit_id = :aid
-                ORDER BY total_size_bytes DESC LIMIT 15;
-            """, aid=audit_id)
-
-            db_top_tables = store_con.run("""
-                SELECT database_name, table_name, total_size_pretty, table_size_pretty, index_size_pretty, estimated_rows, n_dead_tup
-                FROM db_database_tables
-                WHERE audit_id = :aid
-                ORDER BY total_size_bytes DESC;
-            """, aid=audit_id)
-
-            databases_payload = []
-            for db_row in db_catalog_rows:
-                d_name = db_row[0]
-                d_size = db_row[2]
-                d_enc = db_row[4] or "UTF8"
-                d_coll = db_row[5] or "en_US.UTF-8"
-                top_t = [
-                    {
-                        "name": t[1],
-                        "totalSize": t[2],
-                        "dataSize": t[3],
-                        "indexSize": t[4],
-                        "liveRows": int(t[5] or 0),
-                        "deadRows": int(t[6] or 0),
-                    }
-                    for t in db_top_tables if t[0] == d_name
-                ][:5]
-                c_info = conns_by_db.get(d_name, {"total": 0})
-                databases_payload.append({
-                    "name": d_name,
-                    "owner": "postgres",
-                    "size": d_size,
-                    "encoding": d_enc,
-                    "collation": d_coll,
-                    "connectionLimit": -1,
-                    "currentConnections": c_info.get("total", 0),
-                    "tablesCount": len(top_t),
-                    "schemasCount": 1,
-                    "topTables": top_t,
-                })
-
-            inst_id, display_name, short_name, env_name = get_rds_instance_identity(s_host, cluster_env, cluster_title)
-
-            rds_payload = {
-                "id": inst_id,
-                "kind": "rds",
-                "name": display_name,
-                "shortName": short_name,
-                "environment": env_name,
-                "region": "ap-south-1 / ap-south-1a",
-                "status": "warning" if (conn_usage_pct and float(conn_usage_pct) > 80.0) else "healthy",
-                "instanceType": "db.r6g.xlarge",
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "rdsEndpoint": f"{s_host}:{s_port}",
-                "rdsDefaultDb": s_admin_db or "postgres",
-                "rdsUser": s_user,
-                "rdsEngineVersion": engine_version,
-                "rdsUptime": uptime,
-                "rdsStartTime": postmaster_start.strftime("%Y-%m-%d %H:%M:%S UTC") if isinstance(postmaster_start, (datetime.datetime, datetime.date)) else str(postmaster_start or ""),
-                "totalDatabases": len(db_catalog_rows),
-                "totalStorageUsed": total_storage_pretty,
-                "databases": databases_payload,
-                "connectionSummary": {
-                    "currentConnections": curr_conns,
-                    "clusterMax": max_conns,
-                    "superuserReserved": 3,
-                    "usablePool": max(0, max_conns - 3),
-                    "usagePct": float(conn_usage_pct) if conn_usage_pct is not None else 0.0,
-                },
-                "memorySettings": [
-                    {"parameter": r[1], "value": r[2], "description": r[5] or ""}
-                    for r in mem_settings
-                ],
-                "cacheHitRatio": cache_hit_pct,
-                "cpuState": {
-                    "totalBackends": curr_conns,
-                    "cpuComputing": cpu_computing,
-                    "idleSessions": idle_conns,
-                    "idleInTx": idle_tx,
-                    "ioWaiting": io_waiting,
-                    "lockWaiting": lock_waiting,
-                },
-                "dbUsers": [
-                    {
-                        "username": u[0],
-                        "isSuperuser": bool(u[1]),
-                        "inherits": True,
-                        "canCreateRoles": False,
-                        "canCreateDb": False,
-                        "canLogin": bool(u[2]),
-                        "memberOf": u[4] or "",
-                    }
-                    for u in roles_rows
-                ],
-                "topTables": [
-                    {
-                        "schema": t[0],
-                        "name": f"{t[1]}.{t[2]}",
-                        "totalSize": t[3],
-                        "dataSize": t[4],
-                        "indexSize": t[5],
-                        "liveRows": int(t[6] or 0),
-                        "deadRows": int(t[7] or 0),
-                    }
-                    for t in cluster_top_tables
-                ],
-                "networkSettings": [
-                    {"name": r[1], "value": r[2], "description": r[5] or ""}
-                    for r in net_settings
-                ],
-            }
-
+            inst_id, rds_payload = build_rds_payload(store_con, audit_id)
             infra_action = upsert_infra_instance_db(store_con, inst_id, "rds", rds_payload)
         except Exception as e:
             print(f"{YELLOW}Warning: Failed to upsert infra_instances for {cluster_title}: {e}{RESET}")
@@ -1389,7 +1446,7 @@ def main():
     elif args.old_prod or canonical_target == "old_prod":
         execute_discovery_and_store(target_name="old_prod", storage_url=args.storage_url)
     elif args.url:
-        execute_discovery_and_store(custom_url=args.url, storage_url=args.storage_url)
+        execute_discovery_and_store(source_url=args.url, storage_url=args.storage_url)
     elif canonical_target in CLUSTERS_REGISTRY:
         execute_discovery_and_store(target_name=canonical_target, storage_url=args.storage_url)
     else:
